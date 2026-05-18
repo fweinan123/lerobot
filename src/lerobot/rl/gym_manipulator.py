@@ -15,7 +15,9 @@
 # limitations under the License.
 
 import logging
+import signal
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -81,6 +83,40 @@ from lerobot.utils.utils import log_say
 from .joint_observations_processor import JointVelocityProcessorStep, MotorCurrentProcessorStep
 
 logging.basicConfig(level=logging.INFO)
+
+
+@contextmanager
+def defer_keyboard_interrupt(message: str):
+    """Delay Ctrl+C while a short critical filesystem write is in progress."""
+    previous_handler = signal.getsignal(signal.SIGINT)
+    interrupted = False
+
+    def handler(signum, frame):
+        nonlocal interrupted
+        interrupted = True
+        logging.warning("%s; finishing current disk write before exiting.", message)
+
+    signal.signal(signal.SIGINT, handler)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous_handler)
+        if interrupted:
+            raise KeyboardInterrupt
+
+
+def finalize_recording_dataset(dataset: LeRobotDataset | None) -> None:
+    """Discard an unfinished episode and close dataset writers cleanly."""
+    if dataset is None:
+        return
+
+    if dataset.has_pending_frames():
+        logging.info("Discarding unfinished episode before shutdown")
+        dataset.clear_episode_buffer()
+
+    logging.info("Finalizing dataset writers")
+    with defer_keyboard_interrupt("Ctrl+C received during dataset finalization"):
+        dataset.finalize()
 
 
 @dataclass
@@ -756,21 +792,22 @@ def control_loop(
                         episode_idx -= 1
                     else:
                         logging.info(f"Saving episode {episode_idx}")
-                        dataset.save_episode()
+                        with defer_keyboard_interrupt("Ctrl+C received while saving episode"):
+                            dataset.save_episode()
 
                 # Reset for new episode
                 transition = reset_and_build_transition(env, env_processor, action_processor)
 
             # Maintain fps timing
             precise_sleep(max(dt - (time.perf_counter() - step_start_time), 0.0))
+    except KeyboardInterrupt:
+        logging.info("Interrupted by user; shutting down cleanly")
+        raise
     finally:
-        if dataset is not None and dataset.writer is not None and dataset.writer.image_writer is not None:
-            logging.info("Waiting for image writer to finish...")
-            dataset.writer.image_writer.stop()
+        if cfg.mode == "record":
+            finalize_recording_dataset(dataset)
 
     if dataset is not None and cfg.dataset.push_to_hub:
-        logging.info("Finalizing dataset before pushing to hub")
-        dataset.finalize()
         logging.info("Pushing dataset to hub")
         dataset.push_to_hub()
 
