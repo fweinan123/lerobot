@@ -516,13 +516,22 @@ def make_processors(
             )
         )
 
-    env_pipeline_steps.append(AddBatchDimensionProcessorStep())
-    env_pipeline_steps.append(DeviceProcessorStep(device=device))
+    env_pipeline_steps.append(AddBatchDimensionProcessorStep())  # 把单条环境数据变成“batch size = 1”的格式，方便后面直接喂给 policy / model
+    env_pipeline_steps.append(DeviceProcessorStep(device=device))  # 把数据搬到指定设备上，比如cuda
+    # 目前的env_pipeline_steps包含：
+    # 1. VanillaObservationProcessorStep: 处理原始环境观测数据，提取关节位置和图像等信息，构造成统一的观察格式。   
+    # 2. JointVelocityProcessorStep: 根据连续两步的关节位置计算关节速度，并将其添加到观察中。
+    # 3. MotorCurrentProcessorStep: 从机器人获取电机电流数据，并将其添加到观察中。
+    # 4. ImageCropResizeProcessorStep(crop_params_dict=None,resize_size=[128, 128],
+    # 5. TimeLimitProcessorStep: 根据配置的最大控制时间计算最大步数，并在达到时终止环境。
+    # 6. GripperPenaltyProcessorStep: 根据当前的夹爪位置计算夹爪惩罚，并将其添加到奖励中。
+    # 7. AddBatchDimensionProcessorStep(): 在环境数据中添加一个批次维度，使其适合直接输入到模型中。
+    # 8. DeviceProcessorStep(device=device): 将环境数据移动到指定的计算设备上（如CPU或GPU），以便后续处理和模型输入。
 
     action_pipeline_steps = [
-        AddTeleopActionAsComplimentaryDataStep(teleop_device=teleop_device),
-        AddTeleopEventsAsInfoStep(teleop_device=teleop_device),
-        InterventionActionProcessorStep(
+        AddTeleopActionAsComplimentaryDataStep(teleop_device=teleop_device),  #  teleop 设备读取当前人工输入
+        AddTeleopEventsAsInfoStep(teleop_device=teleop_device),   # 读取 teleop 事件：是否正在人工干预，是否终止当前 episode，是否成功，是否需要重录等
+        InterventionActionProcessorStep(   # 如果是人工干预，则将tele的action替换原来的action，并根据事件设置done/reward等
             use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False,
             terminate_on_success=terminate_on_success,
         ),
@@ -535,23 +544,23 @@ def make_processors(
             MapTensorToDeltaActionDictStep(
                 use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False
             ),
-            MapDeltaActionToRobotActionStep(),
-            EEReferenceAndDelta(
+            MapDeltaActionToRobotActionStep(),  # 把 delta action 改成 EE 控制格式
+            EEReferenceAndDelta(                # 相对 EE 增量变成绝对 EE 目标位姿
                 kinematics=kinematics_solver,
                 end_effector_step_sizes=cfg.processor.inverse_kinematics.end_effector_step_sizes,
                 motor_names=motor_names,
                 use_latched_reference=False,
                 use_ik_solution=True,
             ),
-            EEBoundsAndSafety(
+            EEBoundsAndSafety(                  # 对 EE 目标位置做安全限制
                 end_effector_bounds=cfg.processor.inverse_kinematics.end_effector_bounds,
             ),
-            GripperVelocityToJoint(
+            GripperVelocityToJoint(             # 把 gripper 的速度/离散命令转换成目标夹爪关节位置
                 clip_max=cfg.processor.max_gripper_pos,
                 speed_factor=1.0,
                 discrete_gripper=True,
             ),
-            InverseKinematicsRLStep(
+            InverseKinematicsRLStep(            # 把目标 EE 位姿转换成关节目标
                 kinematics=kinematics_solver, motor_names=motor_names, initial_guess_current_joints=False
             ),
         ]
