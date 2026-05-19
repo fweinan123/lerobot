@@ -28,6 +28,7 @@ from lerobot.utils.import_utils import _pynput_available, require_package
 from ..teleoperator import Teleoperator
 from ..utils import TeleopEvents
 from .configuration_keyboard import (
+    KeyboardAndSOLeaderTeleopConfig,
     KeyboardEndEffectorTeleopConfig,
     KeyboardRoverTeleopConfig,
     KeyboardTeleopConfig,
@@ -287,6 +288,124 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
             TeleopEvents.SUCCESS: success,
             TeleopEvents.RERECORD_EPISODE: rerecord_episode,
         }
+
+
+class KeyboardAndSOLeaderTeleop(KeyboardTeleop):
+    """
+    Teleop class combining SO101 leader joint actions with keyboard HIL events.
+
+    The SO leader provides joint-position actions for smooth arm teleoperation, while
+    the keyboard listener provides episode and intervention events for HIL-SERL.
+    """
+
+    config_class = KeyboardAndSOLeaderTeleopConfig
+    name = "keyboard_so101_leader"
+    outputs_joint_positions = True
+
+    def __init__(self, config: KeyboardAndSOLeaderTeleopConfig):
+        super().__init__(config)
+        from lerobot.teleoperators.so_leader import SOLeader
+
+        self.config = config
+        self.leader = SOLeader(config)
+        self.misc_keys_queue = Queue()
+        self.is_intervention = config.leader_always_intervenes
+
+    @property
+    def action_features(self) -> dict:
+        return {
+            "dtype": "float32",
+            "shape": (len(self.leader.bus.motors),),
+            "names": {"motors": [f"{motor}.pos" for motor in self.leader.bus.motors]},
+        }
+
+    @property
+    def feedback_features(self) -> dict:
+        return self.leader.feedback_features
+
+    @property
+    def is_connected(self) -> bool:
+        return super().is_connected and self.leader.is_connected
+
+    @property
+    def is_calibrated(self) -> bool:
+        return self.leader.is_calibrated
+
+    @check_if_already_connected
+    def connect(self, calibrate: bool = True) -> None:
+        try:
+            KeyboardTeleop.connect(self)
+            self.leader.connect(calibrate=calibrate)
+        except Exception:
+            if self.listener is not None:
+                self.listener.stop()
+            if self.leader.is_connected:
+                self.leader.disconnect()
+            raise
+
+    def calibrate(self) -> None:
+        self.leader.calibrate()
+
+    def configure(self) -> None:
+        self.leader.configure()
+
+    @check_if_not_connected
+    def get_action(self) -> RobotAction:
+        return self.leader.get_action()
+
+    def _drain_keyboard_events(self) -> None:
+        while not self.event_queue.empty():
+            key_char, is_pressed = self.event_queue.get_nowait()
+            self.current_pressed[key_char] = is_pressed
+            if is_pressed and key_char in {"m", "n", "b", "r", "q"}:
+                self.misc_keys_queue.put(key_char)
+
+    def get_teleop_events(self) -> dict[str, Any]:
+        if not self.is_connected:
+            return {
+                TeleopEvents.IS_INTERVENTION: False,
+                TeleopEvents.TERMINATE_EPISODE: False,
+                TeleopEvents.SUCCESS: False,
+                TeleopEvents.RERECORD_EPISODE: False,
+            }
+
+        self._drain_keyboard_events()
+
+        terminate_episode = False
+        success = False
+        rerecord_episode = False
+
+        while not self.misc_keys_queue.empty():
+            key = self.misc_keys_queue.get_nowait()
+            if key == "m":
+                success = True
+            elif key == "n":
+                self.is_intervention = True
+            elif key == "b":
+                self.is_intervention = False
+            elif key == "r":
+                terminate_episode = True
+                rerecord_episode = True
+            elif key == "q":
+                terminate_episode = True
+                success = False
+
+        return {
+            TeleopEvents.IS_INTERVENTION: self.is_intervention,
+            TeleopEvents.TERMINATE_EPISODE: terminate_episode,
+            TeleopEvents.SUCCESS: success,
+            TeleopEvents.RERECORD_EPISODE: rerecord_episode,
+        }
+
+    @check_if_not_connected
+    def send_feedback(self, feedback: dict[str, Any]) -> None:
+        self.leader.send_feedback(feedback)
+
+    def disconnect(self) -> None:
+        if self.listener is not None:
+            self.listener.stop()
+        if self.leader.is_connected:
+            self.leader.disconnect()
 
 
 class KeyboardRoverTeleop(KeyboardTeleop):

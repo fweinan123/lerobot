@@ -63,6 +63,7 @@ from lerobot.robots.robot import Robot
 from lerobot.robots.so_follower.robot_kinematic_processor import (
     EEBoundsAndSafety,
     EEReferenceAndDelta,
+    ForwardKinematicsJointsToEEAction,
     ForwardKinematicsJointsToEEObservation,
     GripperVelocityToJoint,
     InverseKinematicsRLStep,
@@ -528,37 +529,59 @@ def make_processors(
     # 7. AddBatchDimensionProcessorStep(): 在环境数据中添加一个批次维度，使其适合直接输入到模型中。
     # 8. DeviceProcessorStep(device=device): 将环境数据移动到指定的计算设备上（如CPU或GPU），以便后续处理和模型输入。
 
+    teleop_outputs_joint_positions = bool(
+        teleop_device is not None and getattr(teleop_device, "outputs_joint_positions", False)
+    )
+
     action_pipeline_steps = [
         AddTeleopActionAsComplimentaryDataStep(teleop_device=teleop_device),  #  teleop 设备读取当前人工输入
         AddTeleopEventsAsInfoStep(teleop_device=teleop_device),   # 读取 teleop 事件：是否正在人工干预，是否终止当前 episode，是否成功，是否需要重录等
         InterventionActionProcessorStep(   # 如果是人工干预，则将tele的action替换原来的action，并根据事件设置done/reward等
             use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False,
             terminate_on_success=terminate_on_success,
+            teleop_action_mode="joint" if teleop_outputs_joint_positions else "delta",
+            motor_names=motor_names if teleop_outputs_joint_positions else None,
         ),
     ]
+
+    if teleop_outputs_joint_positions and (
+        cfg.processor.inverse_kinematics is None or kinematics_solver is None
+    ):
+        raise ValueError("Joint-position teleoperation requires inverse_kinematics config for EE bounds.")
 
     # Replace InverseKinematicsProcessor with new kinematic processors
     if cfg.processor.inverse_kinematics is not None and kinematics_solver is not None:
         # Add EE bounds and safety processor
         inverse_kinematics_steps = [
-            MapTensorToDeltaActionDictStep(
-                use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False
+            ForwardKinematicsJointsToEEAction(
+                kinematics=kinematics_solver,
+                motor_names=motor_names,
+                passthrough_non_joint_action=True,
             ),
-            MapDeltaActionToRobotActionStep(),  # 把 delta action 改成 EE 控制格式
+            MapTensorToDeltaActionDictStep(
+                use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False,
+                passthrough_non_policy_action=True,
+            ),
+            MapDeltaActionToRobotActionStep(
+                passthrough_non_delta_action=True,
+            ),  # 把 delta action 改成 EE 控制格式
             EEReferenceAndDelta(                # 相对 EE 增量变成绝对 EE 目标位姿
                 kinematics=kinematics_solver,
                 end_effector_step_sizes=cfg.processor.inverse_kinematics.end_effector_step_sizes,
                 motor_names=motor_names,
                 use_latched_reference=False,
                 use_ik_solution=True,
+                passthrough_non_delta_action=True,
             ),
             EEBoundsAndSafety(                  # 对 EE 目标位置做安全限制
                 end_effector_bounds=cfg.processor.inverse_kinematics.end_effector_bounds,
+                raise_on_unsafe_jump=not teleop_outputs_joint_positions,
             ),
             GripperVelocityToJoint(             # 把 gripper 的速度/离散命令转换成目标夹爪关节位置
                 clip_max=cfg.processor.max_gripper_pos,
                 speed_factor=1.0,
                 discrete_gripper=True,
+                passthrough_if_gripper_pos_exists=True,
             ),
             InverseKinematicsRLStep(            # 把目标 EE 位姿转换成关节目标
                 kinematics=kinematics_solver, motor_names=motor_names, initial_guess_current_joints=False
@@ -609,6 +632,9 @@ def step_env_and_process_transition(
     terminated = terminated or processed_action_transition[TransitionKey.DONE]
     truncated = truncated or processed_action_transition[TransitionKey.TRUNCATED]
     complementary_data = processed_action_transition[TransitionKey.COMPLEMENTARY_DATA].copy()
+    teleop_action = complementary_data.get("teleop_action")
+    if isinstance(teleop_action, dict) and isinstance(processed_action, torch.Tensor):
+        complementary_data["teleop_action"] = processed_action
 
     if hasattr(env, "get_raw_joint_positions"):
         raw_joint_positions = env.get_raw_joint_positions()

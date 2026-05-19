@@ -464,6 +464,8 @@ class InterventionActionProcessorStep(ProcessorStep):
 
     use_gripper: bool = False
     terminate_on_success: bool = True
+    teleop_action_mode: str = "delta"
+    motor_names: list[str] | None = None
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         """
@@ -492,7 +494,20 @@ class InterventionActionProcessorStep(ProcessorStep):
         new_transition = transition.copy()
 
         # Override action if intervention is active
-        if is_intervention and teleop_action is not None:
+        if is_intervention and self.teleop_action_mode == "joint":
+            if self.motor_names is None:
+                raise ValueError("motor_names must be provided when teleop_action_mode='joint'")
+            if not isinstance(teleop_action, dict):
+                raise ValueError(f"Joint teleop action should be a dict, got {type(teleop_action)}")
+
+            missing = [f"{name}.pos" for name in self.motor_names if f"{name}.pos" not in teleop_action]
+            if missing:
+                raise ValueError(f"Missing joint action keys for joint teleop mode: {missing}")
+
+            new_transition[TransitionKey.ACTION] = {
+                f"{name}.pos": float(teleop_action[f"{name}.pos"]) for name in self.motor_names
+            }
+        elif is_intervention and self.teleop_action_mode == "delta" and teleop_action is not None:
             if isinstance(teleop_action, dict):
                 # Convert teleop_action dict to tensor format
                 action_list = [
@@ -506,9 +521,11 @@ class InterventionActionProcessorStep(ProcessorStep):
                 action_list = teleop_action.tolist()
             else:
                 action_list = teleop_action
-
+            # 这里对于键盘ee方式还是将delta定义成tensor格式，方便后续和policy的pipline一样处理
             teleop_action_tensor = torch.tensor(action_list, dtype=action.dtype, device=action.device)
             new_transition[TransitionKey.ACTION] = teleop_action_tensor
+        elif self.teleop_action_mode not in {"delta", "joint"}:
+            raise ValueError(f"Unsupported teleop_action_mode: {self.teleop_action_mode}")
 
         # Handle episode termination
         new_transition[TransitionKey.DONE] = bool(terminate_episode) or (

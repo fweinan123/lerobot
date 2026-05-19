@@ -42,6 +42,16 @@ class KeyboardEndEffectorTeleopConfig(KeyboardTeleopConfig):
     use_gripper: bool = True
 
 
+@TeleoperatorConfig.register_subclass("keyboard_so101_leader")
+@dataclass
+class KeyboardAndSOLeaderTeleopConfig(KeyboardTeleopConfig):
+    """Configuration for combined keyboard events and SO101 leader joint teleoperation."""
+
+    port: str
+    use_degrees: bool = True
+    leader_always_intervenes: bool = True
+
+
 @TeleoperatorConfig.register_subclass("keyboard_rover")
 @dataclass
 class KeyboardRoverTeleopConfig(TeleoperatorConfig):

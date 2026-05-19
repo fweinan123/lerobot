@@ -68,12 +68,29 @@ class EEReferenceAndDelta(RobotActionProcessorStep):
         True  # If True, latch reference on enable; if False, always use current pose
     )
     use_ik_solution: bool = False
+    passthrough_non_delta_action: bool = False
 
     reference_ee_pose: np.ndarray | None = field(default=None, init=False, repr=False)
     _prev_enabled: bool = field(default=False, init=False, repr=False)
     _command_when_disabled: np.ndarray | None = field(default=None, init=False, repr=False)
 
     def action(self, action: RobotAction) -> RobotAction:
+        required_keys = {
+            "enabled",
+            "target_x",
+            "target_y",
+            "target_z",
+            "target_wx",
+            "target_wy",
+            "target_wz",
+            "gripper_vel",
+        }
+        if not required_keys.issubset(action):
+            if self.passthrough_non_delta_action:
+                return action
+            missing = required_keys - set(action)
+            raise ValueError(f"Missing required delta-to-EE action keys: {sorted(missing)}")
+
         observation = self.transition.get(TransitionKey.OBSERVATION).copy()
 
         if observation is None:
@@ -199,6 +216,7 @@ class EEBoundsAndSafety(RobotActionProcessorStep):
 
     end_effector_bounds: dict
     max_ee_step_m: float = 0.05
+    raise_on_unsafe_jump: bool = True
     _last_pos: np.ndarray | None = field(default=None, init=False, repr=False)
 
     def action(self, action: RobotAction) -> RobotAction:
@@ -227,7 +245,8 @@ class EEBoundsAndSafety(RobotActionProcessorStep):
             n = float(np.linalg.norm(dpos))
             if n > self.max_ee_step_m and n > 0:
                 pos = self._last_pos + dpos * (self.max_ee_step_m / n)
-                raise ValueError(f"EE jump {n:.3f}m > {self.max_ee_step_m}m")
+                if self.raise_on_unsafe_jump:
+                    raise ValueError(f"EE jump {n:.3f}m > {self.max_ee_step_m}m")
 
         self._last_pos = pos
 
@@ -361,8 +380,14 @@ class GripperVelocityToJoint(RobotActionProcessorStep):
     clip_min: float = 0.0
     clip_max: float = 100.0
     discrete_gripper: bool = False
+    passthrough_if_gripper_pos_exists: bool = False
 
     def action(self, action: RobotAction) -> RobotAction:
+        if "ee.gripper_vel" not in action:
+            if self.passthrough_if_gripper_pos_exists and "ee.gripper_pos" in action:
+                return action
+            raise ValueError("Missing required end-effector gripper velocity: ee.gripper_vel")
+
         observation = self.transition.get(TransitionKey.OBSERVATION).copy()
 
         gripper_vel = action.pop("ee.gripper_vel")
@@ -472,8 +497,16 @@ class ForwardKinematicsJointsToEEAction(RobotActionProcessorStep):
 
     kinematics: RobotKinematics
     motor_names: list[str]
+    passthrough_non_joint_action: bool = False
 
     def action(self, action: RobotAction) -> RobotAction:
+        joint_keys = {f"{n}.pos" for n in self.motor_names}
+        if not joint_keys.issubset(action):
+            if self.passthrough_non_joint_action:
+                return action
+            missing = joint_keys - set(action)  # 在 action 不是完整 joint action 时，给出清楚的错误信息，方便定位是哪几个关节字段没传进来
+            raise ValueError(f"Missing required joint action keys: {sorted(missing)}")
+
         return compute_forward_kinematics_joints_to_ee(action, self.kinematics, self.motor_names)
 
     def transform_features(

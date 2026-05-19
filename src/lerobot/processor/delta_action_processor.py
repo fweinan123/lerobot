@@ -38,9 +38,12 @@ class MapTensorToDeltaActionDictStep(ActionProcessorStep):
     """
 
     use_gripper: bool = True
+    passthrough_non_policy_action: bool = False
 
     def action(self, action: PolicyAction) -> RobotAction:
         if not isinstance(action, PolicyAction):
+            if self.passthrough_non_policy_action:
+                return action
             raise ValueError("Only PolicyAction is supported for this processor")
 
         if action.dim() > 1:
@@ -90,8 +93,15 @@ class MapDeltaActionToRobotActionStep(RobotActionProcessorStep):
     # Scale factors for delta movements
     position_scale: float = 1.0
     noise_threshold: float = 1e-3  # 1 mm threshold to filter out noise
+    passthrough_non_delta_action: bool = False
 
     def action(self, action: RobotAction) -> RobotAction:
+        if not {"delta_x", "delta_y", "delta_z", "gripper"}.issubset(action):
+            if self.passthrough_non_delta_action:
+                return action
+            missing = {"delta_x", "delta_y", "delta_z", "gripper"} - set(action)
+            raise ValueError(f"Missing required delta action keys: {sorted(missing)}")
+
         # NOTE (maractingi): Action can be a dict from the teleop_devices or a tensor from the policy
         # TODO (maractingi): changing this target_xyz naming convention from the teleop_devices
         delta_x = action.pop("delta_x")
