@@ -1,7 +1,7 @@
 {
   "env": {
     "name": "real_robot",
-    "fps": 60,
+    "fps": 30,
     "processor": {
       "control_mode": "keyboard",
       "observation": {
