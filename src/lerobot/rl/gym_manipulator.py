@@ -815,7 +815,7 @@ def control_loop(
             image_writer_threads=4,
             image_writer_processes=0,
             features=features,
-            camera_encoder=VideoEncoderConfig(vcodec="h264"),
+            # camera_encoder=VideoEncoderConfig(vcodec="h264"),
         )
 
     episode_idx = 0

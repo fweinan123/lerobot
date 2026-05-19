@@ -60,7 +60,7 @@
     "repo_id": "fwn/push_cube",
     "root": null,
     "task": "push_cube",
-    "num_episodes_to_record": 20,
+    "num_episodes_to_record": 5,
     "replay_episode": 0,
     "push_to_hub": false
   },
