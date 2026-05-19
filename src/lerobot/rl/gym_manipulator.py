@@ -273,6 +273,7 @@ class RobotEnv(gym.Env):
         """
         # Reset the robot
         # self.robot.reset()
+        print(f"开始重置环境，等待{self.reset_time_s}秒")
         start_time = time.perf_counter()
         if self.reset_pose is not None:
             log_say("Reset the environment.", play_sounds=True)
@@ -280,6 +281,7 @@ class RobotEnv(gym.Env):
             log_say("Reset the environment done.", play_sounds=True)
 
         precise_sleep(max(self.reset_time_s - (time.perf_counter() - start_time), 0.0))
+        print("环境重置完成")
 
         super().reset(seed=seed, options=options)
 
