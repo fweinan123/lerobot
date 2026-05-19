@@ -27,6 +27,7 @@ import torch
 
 from lerobot.cameras import opencv  # noqa: F401
 from lerobot.configs import parser
+from lerobot.configs import VideoEncoderConfig
 from lerobot.datasets import LeRobotDataset
 from lerobot.envs import HILSerlRobotEnvConfig
 from lerobot.model import RobotKinematics
@@ -83,7 +84,7 @@ from lerobot.utils.utils import log_say
 
 from .joint_observations_processor import JointVelocityProcessorStep, MotorCurrentProcessorStep
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, force=True)
 
 
 @contextmanager
@@ -757,6 +758,7 @@ def control_loop(
             image_writer_threads=4,
             image_writer_processes=0,
             features=features,
+            camera_encoder=VideoEncoderConfig(vcodec="h264"),
         )
 
     episode_idx = 0
