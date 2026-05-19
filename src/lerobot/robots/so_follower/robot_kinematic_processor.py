@@ -523,6 +523,56 @@ class ForwardKinematicsJointsToEEAction(RobotActionProcessorStep):
         return features
 
 
+@ProcessorStepRegistry.register("hold_when_leader_ee_out_of_bounds")
+@dataclass
+class HoldWhenLeaderEEOutOfBoundsStep(RobotActionProcessorStep):
+    """
+    Holds the follower position when a leader joint action would move the EE outside workspace bounds.
+
+    This keeps SO leader teleoperation in joint passthrough mode while still using FK as a safety check.
+    If the leader's forward-kinematics EE position is outside the configured bounds, the action is replaced
+    with the follower's current joint positions from the transition observation.
+    FK 计算 Leader 当前 EE 位置
+    如果 EE 在 end_effector_bounds 内：继续使用 Leader joint
+    如果 EE 超出 end_effector_bounds：替换成当前 Follower joint，保持不动
+    """
+
+    kinematics: RobotKinematics
+    motor_names: list[str]
+    end_effector_bounds: dict
+
+    def action(self, action: RobotAction) -> RobotAction:
+        joint_keys = [f"{name}.pos" for name in self.motor_names]
+        missing = [key for key in joint_keys if key not in action]
+        if missing:
+            raise ValueError(f"Missing leader joint action keys for EE bounds check: {missing}")
+
+        q = np.array([float(action[key]) for key in joint_keys], dtype=float)
+        ee_pose = self.kinematics.forward_kinematics(q)
+        ee_pos = ee_pose[:3, 3]
+
+        lower = np.array(self.end_effector_bounds["min"], dtype=float)
+        upper = np.array(self.end_effector_bounds["max"], dtype=float)
+        is_in_bounds = bool(np.all(ee_pos >= lower) and np.all(ee_pos <= upper))
+        if is_in_bounds:
+            return action
+
+        observation = self.transition.get(TransitionKey.OBSERVATION)
+        if observation is None:
+            raise ValueError("Observation is required to hold follower joints when leader EE is out of bounds")
+
+        missing_observation = [key for key in joint_keys if key not in observation]
+        if missing_observation:
+            raise ValueError(f"Missing follower observation keys for hold action: {missing_observation}")
+
+        return {key: float(observation[key]) for key in joint_keys}
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
 @ProcessorStepRegistry.register(name="forward_kinematics_joints_to_ee")
 @dataclass
 class ForwardKinematicsJointsToEE(ProcessorStep):

@@ -65,6 +65,7 @@ from lerobot.robots.so_follower.robot_kinematic_processor import (
     EEReferenceAndDelta,
     ForwardKinematicsJointsToEEObservation,
     GripperVelocityToJoint,
+    HoldWhenLeaderEEOutOfBoundsStep,
     InverseKinematicsRLStep,
 )
 from lerobot.teleoperators import (
@@ -549,6 +550,16 @@ def make_processors(
                 "Direct SO leader joint passthrough requires leader_always_intervenes=true. "
                 "Policy rollout with SO leader teleop needs the delta/IK safety pipeline."
             )
+        # 暂时先注释调这段代码，实际遥操起来感觉有点卡顿，目前在Leader遥操状态下，不进行EE边界检查了，后续如果需要可以再加回来
+        # if cfg.processor.inverse_kinematics is None or kinematics_solver is None:
+        #     raise ValueError("SO leader joint passthrough requires inverse_kinematics config for EE bounds.")
+        # action_pipeline_steps.append(
+        #     HoldWhenLeaderEEOutOfBoundsStep(
+        #         kinematics=kinematics_solver,
+        #         motor_names=motor_names,
+        #         end_effector_bounds=cfg.processor.inverse_kinematics.end_effector_bounds,
+        #     )
+        # )
         action_pipeline_steps.append(RobotActionToPolicyActionProcessorStep(motor_names=motor_names))
     # Replace InverseKinematicsProcessor with new kinematic processors
     elif cfg.processor.inverse_kinematics is not None and kinematics_solver is not None:
