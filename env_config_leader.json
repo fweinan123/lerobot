@@ -1,0 +1,68 @@
+{
+  "env": {
+    "name": "real_robot",
+    "fps": 60,
+    "processor": {
+      "control_mode": "keyboard",
+      "observation": {
+        "display_cameras": false,
+        "add_joint_velocity_to_observation": true,
+        "add_current_to_observation": true
+      },
+      "image_preprocessing": {
+        "crop_params_dict": null,
+        "resize_size": [128, 128]
+      },
+      "gripper": {
+        "use_gripper": true,
+        "gripper_penalty": 0.0
+      },
+      "reset": {
+        "reset_time_s": 5.0,
+        "control_time_s": 35.0,
+        "fixed_reset_joint_positions": null,
+        "terminate_on_success": true
+      },
+
+      "inverse_kinematics": {
+        "urdf_path": "/home/linx-06/SO-ARM100/Simulation/SO101/so101_new_calib.urdf",
+        "target_frame_name": "gripper_frame_link",
+        "end_effector_bounds": {
+          "min": [0.1417, -0.1659, 0.01],
+          "max": [0.2999, 0.0656, 0.0412]
+        },
+        "end_effector_step_sizes": {
+          "x": 0.005,
+          "y": 0.005,
+          "z": 0.005
+        }
+      }
+    },
+    "robot": {
+      "type": "so101_follower",
+      "port": "/dev/ttyACM0",
+      "id": "my_awesome_follower_arm",
+      "use_degrees": true,
+      "cameras": {
+        "wist": {"type": "opencv", "index_or_path": 0, "width": 640, "height": 480, "fps": 30}
+      }
+    },
+    "teleop": {
+      "type": "keyboard_so101_leader",
+      "port": "/dev/ttyACM1",
+      "id": "my_awesome_leader_arm",
+      "use_degrees": true,
+      "leader_always_intervenes": true
+    }
+  },
+  "dataset": {
+    "repo_id": "fwn/push_cube",
+    "root": null,
+    "task": "push_cube",
+    "num_episodes_to_record": 20,
+    "replay_episode": 0,
+    "push_to_hub": false
+  },
+  "mode": "record",
+  "device": "cuda"
+}
