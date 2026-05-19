@@ -217,9 +217,17 @@ class EEBoundsAndSafety(RobotActionProcessorStep):
     end_effector_bounds: dict
     max_ee_step_m: float = 0.05
     raise_on_unsafe_jump: bool = True
+    passthrough_non_ee_action: bool = False
     _last_pos: np.ndarray | None = field(default=None, init=False, repr=False)
 
     def action(self, action: RobotAction) -> RobotAction:
+        required_keys = {"ee.x", "ee.y", "ee.z", "ee.wx", "ee.wy", "ee.wz"}
+        if not required_keys.issubset(action):
+            if self.passthrough_non_ee_action:
+                return action
+            missing = required_keys - set(action)
+            raise ValueError(f"Missing required end-effector bounds keys: {sorted(missing)}")
+
         x = action["ee.x"]
         y = action["ee.y"]
         z = action["ee.z"]
@@ -381,10 +389,13 @@ class GripperVelocityToJoint(RobotActionProcessorStep):
     clip_max: float = 100.0
     discrete_gripper: bool = False
     passthrough_if_gripper_pos_exists: bool = False
+    passthrough_non_ee_action: bool = False
 
     def action(self, action: RobotAction) -> RobotAction:
         if "ee.gripper_vel" not in action:
             if self.passthrough_if_gripper_pos_exists and "ee.gripper_pos" in action:
+                return action
+            if self.passthrough_non_ee_action and not any(key.startswith("ee.") for key in action):
                 return action
             raise ValueError("Missing required end-effector gripper velocity: ee.gripper_vel")
 
@@ -617,6 +628,7 @@ class InverseKinematicsRLStep(ProcessorStep):
     motor_names: list[str]
     q_curr: np.ndarray | None = field(default=None, init=False, repr=False)
     initial_guess_current_joints: bool = True
+    passthrough_non_ee_action: bool = False
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         new_transition = dict(transition)
@@ -624,6 +636,14 @@ class InverseKinematicsRLStep(ProcessorStep):
         if action is None:
             raise ValueError("Action is required for InverseKinematicsEEToJoints")
         action = dict(action)
+
+        required_keys = {"ee.x", "ee.y", "ee.z", "ee.wx", "ee.wy", "ee.wz", "ee.gripper_pos"}
+        if not required_keys.issubset(action):
+            if self.passthrough_non_ee_action:
+                new_transition[TransitionKey.ACTION] = action
+                return new_transition
+            missing = required_keys - set(action)
+            raise ValueError(f"Missing required IK action keys: {sorted(missing)}")
 
         x = action.pop("ee.x")
         y = action.pop("ee.y")

@@ -20,7 +20,7 @@
       "reset": {
         "reset_time_s": 5.0,
         "control_time_s": 35.0,
-        "fixed_reset_joint_positions": null,
+        "fixed_reset_joint_positions": [ 35.7802,  27.3407, -12.8791,  84.6154,  21.9341,   2.1277],
         "terminate_on_success": true
       },
 
@@ -52,7 +52,8 @@
       "port": "/dev/ttyACM1",
       "id": "my_awesome_leader_arm",
       "use_degrees": true,
-      "leader_always_intervenes": true
+      "leader_always_intervenes": false,
+      "leader_follow_policy": true
     }
   },
   "dataset": {

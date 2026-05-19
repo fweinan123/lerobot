@@ -33,6 +33,7 @@ from lerobot.envs import HILSerlRobotEnvConfig
 from lerobot.model import RobotKinematics
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
+    AddRecordActionAsComplementaryDataStep,
     AddTeleopActionAsComplimentaryDataStep,
     AddTeleopEventsAsInfoStep,
     DataProcessorPipeline,
@@ -55,6 +56,7 @@ from lerobot.processor import (
     create_transition,
     identity_transition,
 )
+from lerobot.processor.hil_processor import RECORD_ACTION_KEY
 from lerobot.robots import (  # noqa: F401
     RobotConfig,
     make_robot_from_config,
@@ -66,7 +68,6 @@ from lerobot.robots.so_follower.robot_kinematic_processor import (
     EEReferenceAndDelta,
     ForwardKinematicsJointsToEEObservation,
     GripperVelocityToJoint,
-    HoldWhenLeaderEEOutOfBoundsStep,
     InverseKinematicsRLStep,
 )
 from lerobot.teleoperators import (
@@ -534,7 +535,12 @@ def make_processors(
 
     teleop_outputs_joint_positions = bool(
         teleop_device is not None and getattr(teleop_device, "outputs_joint_positions", False)
-    )
+    )   # 判读是否使用 SO 领导者模式的 teleop 输出关节位置（而不是用键盘delta 位置）
+
+    if teleop_outputs_joint_positions and (
+        cfg.processor.inverse_kinematics is None or kinematics_solver is None
+    ):
+        raise ValueError("SO leader teleop requires inverse_kinematics config to record EE delta actions.")
 
     action_pipeline_steps = [
         AddTeleopActionAsComplimentaryDataStep(teleop_device=teleop_device),  #  teleop 设备读取当前人工输入
@@ -545,26 +551,64 @@ def make_processors(
             teleop_action_mode="joint" if teleop_outputs_joint_positions else "delta",
             motor_names=motor_names if teleop_outputs_joint_positions else None,
         ),
+        AddRecordActionAsComplementaryDataStep(
+            use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False,
+            teleop_action_mode="joint" if teleop_outputs_joint_positions else "delta",
+            motor_names=motor_names if teleop_outputs_joint_positions else None,
+            kinematics=kinematics_solver if teleop_outputs_joint_positions else None,
+            end_effector_step_sizes=cfg.processor.inverse_kinematics.end_effector_step_sizes
+            if teleop_outputs_joint_positions and cfg.processor.inverse_kinematics is not None
+            else None,
+        ),
     ]
 
+    # 使用Leader作为teleop设备时
     if teleop_outputs_joint_positions:
-        if not getattr(getattr(teleop_device, "config", None), "leader_always_intervenes", False):
-            raise ValueError(
-                "Direct SO leader joint passthrough requires leader_always_intervenes=true. "
-                "Policy rollout with SO leader teleop needs the delta/IK safety pipeline."
+        leader_always_intervenes = bool(
+            getattr(getattr(teleop_device, "config", None), "leader_always_intervenes", False)
+        )
+        leader_follow_policy = bool(
+            getattr(getattr(teleop_device, "config", None), "leader_follow_policy", False)
+        )
+        if not leader_always_intervenes or leader_follow_policy:
+            action_pipeline_steps.extend(
+                [
+                    MapTensorToDeltaActionDictStep(
+                        use_gripper=cfg.processor.gripper.use_gripper
+                        if cfg.processor.gripper is not None
+                        else False,
+                        passthrough_non_policy_action=True,
+                    ),
+                    MapDeltaActionToRobotActionStep(passthrough_non_delta_action=True),
+                    EEReferenceAndDelta(
+                        kinematics=kinematics_solver,
+                        end_effector_step_sizes=cfg.processor.inverse_kinematics.end_effector_step_sizes,
+                        motor_names=motor_names,
+                        use_latched_reference=False,
+                        use_ik_solution=True,
+                        passthrough_non_delta_action=True,
+                    ),
+                    EEBoundsAndSafety(
+                        end_effector_bounds=cfg.processor.inverse_kinematics.end_effector_bounds,
+                        passthrough_non_ee_action=True,
+                    ),
+                    GripperVelocityToJoint(
+                        clip_max=cfg.processor.max_gripper_pos,
+                        speed_factor=1.0,
+                        discrete_gripper=True,
+                        passthrough_if_gripper_pos_exists=True,
+                        passthrough_non_ee_action=True,
+                    ),
+                    InverseKinematicsRLStep(
+                        kinematics=kinematics_solver,
+                        motor_names=motor_names,
+                        initial_guess_current_joints=False,
+                        passthrough_non_ee_action=True,
+                    ),
+                ]
             )
-        # 暂时先注释调这段代码，实际遥操起来感觉有点卡顿，目前在Leader遥操状态下，不进行EE边界检查了，后续如果需要可以再加回来
-        # if cfg.processor.inverse_kinematics is None or kinematics_solver is None:
-        #     raise ValueError("SO leader joint passthrough requires inverse_kinematics config for EE bounds.")
-        # action_pipeline_steps.append(
-        #     HoldWhenLeaderEEOutOfBoundsStep(
-        #         kinematics=kinematics_solver,
-        #         motor_names=motor_names,
-        #         end_effector_bounds=cfg.processor.inverse_kinematics.end_effector_bounds,
-        #     )
-        # )
         action_pipeline_steps.append(RobotActionToPolicyActionProcessorStep(motor_names=motor_names))
-    # Replace InverseKinematicsProcessor with new kinematic processors
+    # 使用键盘ee作为teleop设备时
     elif cfg.processor.inverse_kinematics is not None and kinematics_solver is not None:
         # Add EE bounds and safety processor
         inverse_kinematics_steps = [
@@ -607,6 +651,7 @@ def step_env_and_process_transition(
     action: torch.Tensor,
     env_processor: DataProcessorPipeline[EnvTransition, EnvTransition],
     action_processor: DataProcessorPipeline[EnvTransition, EnvTransition],
+    teleop_device: Teleoperator | None = None,
 ) -> EnvTransition:
     """
     Execute one step with processor pipeline.
@@ -630,15 +675,26 @@ def step_env_and_process_transition(
     processed_action_transition = action_processor(transition)
     processed_action = processed_action_transition[TransitionKey.ACTION]
 
+    action_info = processed_action_transition[TransitionKey.INFO]
+    is_intervention = bool(action_info.get(TeleopEvents.IS_INTERVENTION, False))
+    leader_follow_policy = bool(
+        teleop_device is not None
+        and getattr(getattr(teleop_device, "config", None), "leader_follow_policy", False)
+    )
+    if leader_follow_policy and not is_intervention and isinstance(processed_action, torch.Tensor):
+        processed_action_cpu = processed_action.detach().cpu()
+        feedback = {
+            f"{name}.pos": float(processed_action_cpu[i])
+            for i, name in enumerate(env.robot.bus.motors.keys())
+        }
+        teleop_device.send_feedback(feedback)
+
     obs, reward, terminated, truncated, info = env.step(processed_action)
 
     reward = reward + processed_action_transition[TransitionKey.REWARD]
     terminated = terminated or processed_action_transition[TransitionKey.DONE]
     truncated = truncated or processed_action_transition[TransitionKey.TRUNCATED]
     complementary_data = processed_action_transition[TransitionKey.COMPLEMENTARY_DATA].copy()
-    teleop_action = complementary_data.get("teleop_action")
-    if isinstance(teleop_action, dict) and isinstance(processed_action, torch.Tensor):
-        complementary_data["teleop_action"] = processed_action
 
     if hasattr(env, "get_raw_joint_positions"):
         raw_joint_positions = env.get_raw_joint_positions()
@@ -647,7 +703,6 @@ def step_env_and_process_transition(
 
     # Merge env and action-processor info: env wins for str keys, action-processor
     # wins for `TeleopEvents` enum keys
-    action_info = processed_action_transition[TransitionKey.INFO]
     new_info = info.copy()
     for key, value in action_info.items():
         if isinstance(key, TeleopEvents):
@@ -717,14 +772,14 @@ def control_loop(
 
     dataset = None
     if cfg.mode == "record":
-        if teleop_device:
-            action_features = teleop_device.action_features
-        else:
-            action_features = {
-                "dtype": "float32",
-                "shape": (4,),
-                "names": ["delta_x", "delta_y", "delta_z", "gripper"],
-            }
+        action_names = {"delta_x": 0, "delta_y": 1, "delta_z": 2}
+        if use_gripper:
+            action_names["gripper"] = 3
+        action_features = {
+            "dtype": "float32",
+            "shape": (4 if use_gripper else 3,),
+            "names": action_names,
+        }
         features = {
             ACTION: action_features,
             REWARD: {"dtype": "float32", "shape": (1,), "names": None},
@@ -788,13 +843,14 @@ def control_loop(
                 action=neutral_action,
                 env_processor=env_processor,
                 action_processor=action_processor,
+                teleop_device=teleop_device,
             )
             terminated = transition.get(TransitionKey.DONE, False)
             truncated = transition.get(TransitionKey.TRUNCATED, False)
 
             if cfg.mode == "record":
                 action_to_record = transition[TransitionKey.COMPLEMENTARY_DATA].get(
-                    "teleop_action", transition[TransitionKey.ACTION]
+                    RECORD_ACTION_KEY, transition[TransitionKey.ACTION]
                 )
                 frame = {
                     **observation,

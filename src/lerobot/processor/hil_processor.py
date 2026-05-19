@@ -29,7 +29,7 @@ from lerobot.teleoperators.utils import TeleopEvents
 if TYPE_CHECKING:
     from lerobot.teleoperators.teleoperator import Teleoperator
 
-from lerobot.types import EnvTransition, PolicyAction, TransitionKey
+from lerobot.types import EnvTransition, PolicyAction, RobotAction, TransitionKey
 
 from .pipeline import (
     ComplementaryDataProcessorStep,
@@ -43,6 +43,7 @@ from .pipeline import (
 GRIPPER_KEY = "gripper"
 DISCRETE_PENALTY_KEY = "discrete_penalty"
 TELEOP_ACTION_KEY = "teleop_action"
+RECORD_ACTION_KEY = "record_action"
 
 
 @runtime_checkable
@@ -439,6 +440,111 @@ class GripperPenaltyProcessorStep(ProcessorStep):
     def reset(self) -> None:
         """Resets the processor's internal state."""
         pass
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
+@ProcessorStepRegistry.register("add_record_action_as_complementary_data")
+@dataclass
+class AddRecordActionAsComplementaryDataStep(ProcessorStep):
+    """
+    Stores the policy-learning action under complementary_data["record_action"].
+
+    For delta-action policies this keeps dataset actions in the policy space
+    (`delta_x`, `delta_y`, `delta_z`, optional `gripper`) even when the intervention
+    action used for control comes from a joint-space leader.
+    """
+
+    use_gripper: bool = False
+    teleop_action_mode: str = "delta"
+    motor_names: list[str] | None = None
+    kinematics: Any | None = None
+    end_effector_step_sizes: dict[str, float] | None = None
+    gripper_delta_threshold: float = 1.0
+
+    def _delta_dict_to_tensor(self, action: RobotAction) -> torch.Tensor:
+        action_list = [
+            action.get("delta_x", 0.0),
+            action.get("delta_y", 0.0),
+            action.get("delta_z", 0.0),
+        ]
+        if self.use_gripper:
+            action_list.append(action.get(GRIPPER_KEY, 1.0))
+        return torch.tensor(action_list, dtype=torch.float32)
+
+    def _leader_joint_action_to_delta_tensor(
+        self, action: RobotAction, observation: dict[str, Any]
+    ) -> torch.Tensor:
+        if self.motor_names is None:
+            raise ValueError("motor_names must be provided to convert leader joint action to delta action")
+        if self.kinematics is None:
+            raise ValueError("kinematics must be provided to convert leader joint action to delta action")
+        if self.end_effector_step_sizes is None:
+            raise ValueError(
+                "end_effector_step_sizes must be provided to convert leader joint action to delta action"
+            )
+
+        joint_keys = [f"{name}.pos" for name in self.motor_names]
+        missing_action = [key for key in joint_keys if key not in action]
+        if missing_action:
+            raise ValueError(f"Missing leader joint action keys for record action: {missing_action}")
+        missing_observation = [key for key in joint_keys if key not in observation]
+        if missing_observation:
+            raise ValueError(f"Missing follower observation keys for record action: {missing_observation}")
+
+        current_q = np.array([float(observation[key]) for key in joint_keys], dtype=float)
+        leader_q = np.array([float(action[key]) for key in joint_keys], dtype=float)
+        current_ee = self.kinematics.forward_kinematics(current_q)
+        leader_ee = self.kinematics.forward_kinematics(leader_q)
+
+        delta_m = leader_ee[:3, 3] - current_ee[:3, 3]
+        delta_action = np.array(
+            [
+                delta_m[0] / float(self.end_effector_step_sizes["x"]),
+                delta_m[1] / float(self.end_effector_step_sizes["y"]),
+                delta_m[2] / float(self.end_effector_step_sizes["z"]),
+            ],
+            dtype=np.float32,
+        )
+        delta_action = np.clip(delta_action, -1.0, 1.0)
+        action_list = delta_action.tolist()
+
+        if self.use_gripper:
+            current_gripper = float(observation["gripper.pos"])
+            leader_gripper = float(action["gripper.pos"])
+            if leader_gripper > current_gripper + self.gripper_delta_threshold:
+                gripper_action = 0.0
+            elif leader_gripper < current_gripper - self.gripper_delta_threshold:
+                gripper_action = 2.0
+            else:
+                gripper_action = 1.0
+            action_list.append(gripper_action)
+
+        return torch.tensor(action_list, dtype=torch.float32)
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        new_transition = transition.copy()
+        action = new_transition.get(TransitionKey.ACTION)
+        complementary_data = dict(new_transition.get(TransitionKey.COMPLEMENTARY_DATA, {}))
+
+        if isinstance(action, PolicyAction):
+            record_action = action.squeeze(0) if action.dim() > 1 else action
+            complementary_data[RECORD_ACTION_KEY] = record_action.detach().clone()
+        elif isinstance(action, dict) and {"delta_x", "delta_y", "delta_z"}.issubset(action):
+            complementary_data[RECORD_ACTION_KEY] = self._delta_dict_to_tensor(action)
+        elif isinstance(action, dict) and self.teleop_action_mode == "joint":
+            observation = new_transition.get(TransitionKey.OBSERVATION, {})
+            complementary_data[RECORD_ACTION_KEY] = self._leader_joint_action_to_delta_tensor(
+                action, observation
+            )
+        else:
+            raise ValueError(f"Unsupported action type for record_action: {type(action)}")
+
+        new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
+        return new_transition
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]

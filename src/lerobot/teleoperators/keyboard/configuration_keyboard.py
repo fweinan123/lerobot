@@ -50,6 +50,7 @@ class KeyboardAndSOLeaderTeleopConfig(KeyboardTeleopConfig):
     port: str
     use_degrees: bool = True
     leader_always_intervenes: bool = True
+    leader_follow_policy: bool = False
 
 
 @TeleoperatorConfig.register_subclass("keyboard_rover")

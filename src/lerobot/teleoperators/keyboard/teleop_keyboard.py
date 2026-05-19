@@ -336,6 +336,10 @@ class KeyboardAndSOLeaderTeleop(KeyboardTeleop):
         try:
             KeyboardTeleop.connect(self)
             self.leader.connect(calibrate=calibrate)
+            if self.config.leader_always_intervenes:
+                self.leader.disable_torque()
+            elif self.config.leader_follow_policy:
+                self.leader.enable_torque()
         except Exception:
             if self.listener is not None:
                 self.listener.stop()
@@ -381,8 +385,11 @@ class KeyboardAndSOLeaderTeleop(KeyboardTeleop):
                 success = True
             elif key == "n":
                 self.is_intervention = True
+                self.leader.disable_torque()
             elif key == "b":
                 self.is_intervention = False
+                if self.config.leader_follow_policy:
+                    self.leader.enable_torque()
             elif key == "r":
                 terminate_episode = True
                 rerecord_episode = True
