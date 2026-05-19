@@ -553,11 +553,6 @@ def make_processors(
     if cfg.processor.inverse_kinematics is not None and kinematics_solver is not None:
         # Add EE bounds and safety processor
         inverse_kinematics_steps = [
-            ForwardKinematicsJointsToEEAction(
-                kinematics=kinematics_solver,
-                motor_names=motor_names,
-                passthrough_non_joint_action=True,
-            ),
             MapTensorToDeltaActionDictStep(
                 use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False,
                 passthrough_non_policy_action=True,
@@ -572,6 +567,11 @@ def make_processors(
                 use_latched_reference=False,
                 use_ik_solution=True,
                 passthrough_non_delta_action=True,
+            ),
+            ForwardKinematicsJointsToEEAction(
+                kinematics=kinematics_solver,
+                motor_names=motor_names,
+                passthrough_non_joint_action=True,
             ),
             EEBoundsAndSafety(                  # 对 EE 目标位置做安全限制
                 end_effector_bounds=cfg.processor.inverse_kinematics.end_effector_bounds,
