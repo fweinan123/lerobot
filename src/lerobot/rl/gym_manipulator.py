@@ -63,7 +63,6 @@ from lerobot.robots.robot import Robot
 from lerobot.robots.so_follower.robot_kinematic_processor import (
     EEBoundsAndSafety,
     EEReferenceAndDelta,
-    ForwardKinematicsJointsToEEAction,
     ForwardKinematicsJointsToEEObservation,
     GripperVelocityToJoint,
     InverseKinematicsRLStep,
@@ -544,44 +543,35 @@ def make_processors(
         ),
     ]
 
-    if teleop_outputs_joint_positions and (
-        cfg.processor.inverse_kinematics is None or kinematics_solver is None
-    ):
-        raise ValueError("Joint-position teleoperation requires inverse_kinematics config for EE bounds.")
-
+    if teleop_outputs_joint_positions:
+        if not getattr(getattr(teleop_device, "config", None), "leader_always_intervenes", False):
+            raise ValueError(
+                "Direct SO leader joint passthrough requires leader_always_intervenes=true. "
+                "Policy rollout with SO leader teleop needs the delta/IK safety pipeline."
+            )
+        action_pipeline_steps.append(RobotActionToPolicyActionProcessorStep(motor_names=motor_names))
     # Replace InverseKinematicsProcessor with new kinematic processors
-    if cfg.processor.inverse_kinematics is not None and kinematics_solver is not None:
+    elif cfg.processor.inverse_kinematics is not None and kinematics_solver is not None:
         # Add EE bounds and safety processor
         inverse_kinematics_steps = [
             MapTensorToDeltaActionDictStep(
                 use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False,
-                passthrough_non_policy_action=True,
             ),
-            MapDeltaActionToRobotActionStep(
-                passthrough_non_delta_action=True,
-            ),  # 把 delta action 改成 EE 控制格式
+            MapDeltaActionToRobotActionStep(),  # 把 delta action 改成 EE 控制格式
             EEReferenceAndDelta(                # 相对 EE 增量变成绝对 EE 目标位姿
                 kinematics=kinematics_solver,
                 end_effector_step_sizes=cfg.processor.inverse_kinematics.end_effector_step_sizes,
                 motor_names=motor_names,
                 use_latched_reference=False,
                 use_ik_solution=True,
-                passthrough_non_delta_action=True,
-            ),
-            ForwardKinematicsJointsToEEAction(
-                kinematics=kinematics_solver,
-                motor_names=motor_names,
-                passthrough_non_joint_action=True,
             ),
             EEBoundsAndSafety(                  # 对 EE 目标位置做安全限制
                 end_effector_bounds=cfg.processor.inverse_kinematics.end_effector_bounds,
-                raise_on_unsafe_jump=not teleop_outputs_joint_positions,
             ),
             GripperVelocityToJoint(             # 把 gripper 的速度/离散命令转换成目标夹爪关节位置
                 clip_max=cfg.processor.max_gripper_pos,
                 speed_factor=1.0,
                 discrete_gripper=True,
-                passthrough_if_gripper_pos_exists=True,
             ),
             InverseKinematicsRLStep(            # 把目标 EE 位姿转换成关节目标
                 kinematics=kinematics_solver, motor_names=motor_names, initial_guess_current_joints=False
