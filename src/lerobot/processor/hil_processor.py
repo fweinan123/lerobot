@@ -615,9 +615,17 @@ class InterventionActionProcessorStep(ProcessorStep):
             if missing:
                 raise ValueError(f"Missing joint action keys for joint teleop mode: {missing}")
             # 如果是Leader遥操时，则已经将transition[action]转换成了6jonint的字典
-            new_transition[TransitionKey.ACTION] = {  
+            joint_action = {
                 f"{name}.pos": float(teleop_action[f"{name}.pos"]) for name in self.motor_names
             }
+            new_transition[TransitionKey.ACTION] = joint_action
+
+            complementary_data = dict(new_transition.get(TransitionKey.COMPLEMENTARY_DATA, {}))
+            complementary_data["IK_solution"] = np.array(
+                [joint_action[f"{name}.pos"] for name in self.motor_names],
+                dtype=float,
+            )
+            new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
         elif is_intervention and self.teleop_action_mode == "delta" and teleop_action is not None:
             if isinstance(teleop_action, dict):
                 # Convert teleop_action dict to tensor format
