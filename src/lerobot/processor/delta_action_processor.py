@@ -43,6 +43,7 @@ class MapTensorToDeltaActionDictStep(ActionProcessorStep):
     def action(self, action: PolicyAction) -> RobotAction:
         if not isinstance(action, PolicyAction):
             if self.passthrough_non_policy_action:
+                print("MapTensorToDeltaActionDictStep退出")
                 return action
             raise ValueError("Only PolicyAction is supported for this processor")
 
@@ -98,6 +99,7 @@ class MapDeltaActionToRobotActionStep(RobotActionProcessorStep):
     def action(self, action: RobotAction) -> RobotAction:
         if not {"delta_x", "delta_y", "delta_z", "gripper"}.issubset(action):
             if self.passthrough_non_delta_action:
+                print("退出")
                 return action
             missing = {"delta_x", "delta_y", "delta_z", "gripper"} - set(action)
             raise ValueError(f"Missing required delta action keys: {sorted(missing)}")

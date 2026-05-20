@@ -44,6 +44,7 @@ GRIPPER_KEY = "gripper"
 DISCRETE_PENALTY_KEY = "discrete_penalty"
 TELEOP_ACTION_KEY = "teleop_action"
 RECORD_ACTION_KEY = "record_action"
+LEADER_JOINT_ACTION_KEY = "leader_joint_action"
 
 
 @runtime_checkable
@@ -529,13 +530,21 @@ class AddRecordActionAsComplementaryDataStep(ProcessorStep):
         new_transition = transition.copy()
         action = new_transition.get(TransitionKey.ACTION)
         complementary_data = dict(new_transition.get(TransitionKey.COMPLEMENTARY_DATA, {}))
+        info = new_transition.get(TransitionKey.INFO, {})
+        is_intervention = bool(info.get(TeleopEvents.IS_INTERVENTION, False))
+        leader_joint_action = complementary_data.get(LEADER_JOINT_ACTION_KEY)
 
-        if isinstance(action, PolicyAction):
+        if is_intervention and self.teleop_action_mode == "joint" and leader_joint_action is not None:
+            observation = new_transition.get(TransitionKey.OBSERVATION, {})
+            complementary_data[RECORD_ACTION_KEY] = self._leader_joint_action_to_delta_tensor(
+                leader_joint_action, observation
+            )
+        elif isinstance(action, PolicyAction):
             record_action = action.squeeze(0) if action.dim() > 1 else action
             complementary_data[RECORD_ACTION_KEY] = record_action.detach().clone()
         elif isinstance(action, dict) and {"delta_x", "delta_y", "delta_z"}.issubset(action):
             complementary_data[RECORD_ACTION_KEY] = self._delta_dict_to_tensor(action)
-        elif isinstance(action, dict) and self.teleop_action_mode == "joint":
+        elif isinstance(action, dict) and self.teleop_action_mode == "joint":   # 这个分支应该用不到了
             observation = new_transition.get(TransitionKey.OBSERVATION, {})
             complementary_data[RECORD_ACTION_KEY] = self._leader_joint_action_to_delta_tensor(
                 action, observation
@@ -575,6 +584,65 @@ class InterventionActionProcessorStep(ProcessorStep):
     terminate_on_success: bool = True
     teleop_action_mode: str = "delta"
     motor_names: list[str] | None = None
+    kinematics: Any | None = None
+    end_effector_step_sizes: dict[str, float] | None = None
+    gripper_delta_threshold: float = 1.0
+
+    def _leader_joint_action_to_delta_tensor(
+        self,
+        leader_joint_action: RobotAction,
+        transition: EnvTransition,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if self.motor_names is None:
+            raise ValueError("motor_names must be provided when teleop_action_mode='joint'")
+        if self.kinematics is None:
+            raise ValueError("kinematics must be provided when teleop_action_mode='joint'")
+        if self.end_effector_step_sizes is None:
+            raise ValueError("end_effector_step_sizes must be provided when teleop_action_mode='joint'")
+
+        joint_keys = [f"{name}.pos" for name in self.motor_names]
+        missing_action = [key for key in joint_keys if key not in leader_joint_action]
+        if missing_action:
+            raise ValueError(f"Missing leader joint action keys for intervention delta: {missing_action}")
+
+        complementary_data = transition.get(TransitionKey.COMPLEMENTARY_DATA, {})
+        previous_q = complementary_data.get("IK_solution")
+        if previous_q is None:
+            observation = transition.get(TransitionKey.OBSERVATION, {})
+            missing_observation = [key for key in joint_keys if key not in observation]
+            if missing_observation:
+                raise ValueError(
+                    f"Missing follower observation keys for intervention delta: {missing_observation}"
+                )
+            previous_q = np.array([float(observation[key]) for key in joint_keys], dtype=float)
+        else:
+            previous_q = np.array(previous_q, dtype=float)
+
+        leader_q = np.array([float(leader_joint_action[key]) for key in joint_keys], dtype=float)
+        previous_ee = self.kinematics.forward_kinematics(previous_q)
+        leader_ee = self.kinematics.forward_kinematics(leader_q)
+
+        delta_m = leader_ee[:3, 3] - previous_ee[:3, 3]
+        action_list = [
+            delta_m[0] / float(self.end_effector_step_sizes["x"]),
+            delta_m[1] / float(self.end_effector_step_sizes["y"]),
+            delta_m[2] / float(self.end_effector_step_sizes["z"]),
+        ]
+
+        if self.use_gripper:
+            previous_gripper = float(previous_q[-1])
+            leader_gripper = float(leader_joint_action[f"{self.motor_names[-1]}.pos"])
+            if leader_gripper > previous_gripper + self.gripper_delta_threshold:
+                gripper_action = 0.0
+            elif leader_gripper < previous_gripper - self.gripper_delta_threshold:
+                gripper_action = 2.0
+            else:
+                gripper_action = 1.0
+            action_list.append(gripper_action)
+
+        return torch.tensor(action_list, dtype=dtype, device=device)
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         """
@@ -618,14 +686,16 @@ class InterventionActionProcessorStep(ProcessorStep):
             joint_action = {
                 f"{name}.pos": float(teleop_action[f"{name}.pos"]) for name in self.motor_names
             }
-            new_transition[TransitionKey.ACTION] = joint_action
 
             complementary_data = dict(new_transition.get(TransitionKey.COMPLEMENTARY_DATA, {}))
-            complementary_data["IK_solution"] = np.array(
-                [joint_action[f"{name}.pos"] for name in self.motor_names],
-                dtype=float,
-            )
+            complementary_data[LEADER_JOINT_ACTION_KEY] = joint_action
             new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
+            new_transition[TransitionKey.ACTION] = self._leader_joint_action_to_delta_tensor(
+                joint_action,
+                new_transition,
+                dtype=action.dtype,
+                device=action.device,
+            )
         elif is_intervention and self.teleop_action_mode == "delta" and teleop_action is not None:
             if isinstance(teleop_action, dict):
                 # Convert teleop_action dict to tensor format

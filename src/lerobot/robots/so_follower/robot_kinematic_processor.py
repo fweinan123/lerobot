@@ -87,6 +87,7 @@ class EEReferenceAndDelta(RobotActionProcessorStep):
         }
         if not required_keys.issubset(action):
             if self.passthrough_non_delta_action:
+                print("EEReferenceAndDelta退出")
                 return action
             missing = required_keys - set(action)
             raise ValueError(f"Missing required delta-to-EE action keys: {sorted(missing)}")
@@ -224,6 +225,7 @@ class EEBoundsAndSafety(RobotActionProcessorStep):
         required_keys = {"ee.x", "ee.y", "ee.z", "ee.wx", "ee.wy", "ee.wz"}
         if not required_keys.issubset(action):
             if self.passthrough_non_ee_action:
+                print("EEReferenceAndDelta退出")
                 return action
             missing = required_keys - set(action)
             raise ValueError(f"Missing required end-effector bounds keys: {sorted(missing)}")

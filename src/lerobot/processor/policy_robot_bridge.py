@@ -17,10 +17,12 @@
 from dataclasses import asdict, dataclass
 from typing import Any
 
+import numpy as np
 import torch
 
 from lerobot.configs import FeatureType, PipelineFeatureType, PolicyFeature
-from lerobot.types import PolicyAction, RobotAction
+from lerobot.teleoperators.utils import TeleopEvents
+from lerobot.types import PolicyAction, RobotAction, TransitionKey
 from lerobot.utils.constants import ACTION
 
 from .pipeline import ActionProcessorStep, ProcessorStepRegistry
@@ -32,11 +34,37 @@ class RobotActionToPolicyActionProcessorStep(ActionProcessorStep):
     """Processor step to map a dictionary to a tensor action."""
 
     motor_names: list[str]
+    leader_joint_override_key: str | None = None
+
+    def _get_leader_joint_override(self) -> RobotAction | None:
+        if self.leader_joint_override_key is not None:
+            info = self.transition.get(TransitionKey.INFO, {})
+            complementary_data = self.transition.get(TransitionKey.COMPLEMENTARY_DATA, {})
+            if bool(info.get(TeleopEvents.IS_INTERVENTION, False)):
+                leader_joint_action = complementary_data.get(self.leader_joint_override_key)
+                if leader_joint_action is not None:
+                    return leader_joint_action
+        return None
 
     def action(self, action: RobotAction) -> PolicyAction:
+        leader_joint_action = self._get_leader_joint_override()
+        if leader_joint_action is not None:
+            action = leader_joint_action
         if len(self.motor_names) != len(action):
             raise ValueError(f"Action must have {len(self.motor_names)} elements, got {len(action)}")
         return torch.tensor([action[f"{name}.pos"] for name in self.motor_names])
+
+    def __call__(self, transition):
+        new_transition = super().__call__(transition)
+        leader_joint_action = self._get_leader_joint_override()
+        if leader_joint_action is not None:
+            complementary_data = dict(new_transition.get(TransitionKey.COMPLEMENTARY_DATA, {}))
+            complementary_data["IK_solution"] = np.array(
+                [leader_joint_action[f"{name}.pos"] for name in self.motor_names],
+                dtype=float,
+            )
+            new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
+        return new_transition
 
     def get_config(self) -> dict[str, Any]:
         return asdict(self)

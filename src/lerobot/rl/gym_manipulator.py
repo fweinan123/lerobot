@@ -550,6 +550,10 @@ def make_processors(
             terminate_on_success=terminate_on_success,
             teleop_action_mode="joint" if teleop_outputs_joint_positions else "delta",
             motor_names=motor_names if teleop_outputs_joint_positions else None,
+            kinematics=kinematics_solver if teleop_outputs_joint_positions else None,
+            end_effector_step_sizes=cfg.processor.inverse_kinematics.end_effector_step_sizes
+            if teleop_outputs_joint_positions and cfg.processor.inverse_kinematics is not None
+            else None,
         ),
         AddRecordActionAsComplementaryDataStep(
             use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False,
@@ -564,50 +568,40 @@ def make_processors(
 
     # 使用Leader作为teleop设备时
     if teleop_outputs_joint_positions:
-        leader_always_intervenes = bool(
-            getattr(getattr(teleop_device, "config", None), "leader_always_intervenes", False)
+        action_pipeline_steps.extend(
+            [
+                MapTensorToDeltaActionDictStep(
+                    use_gripper=cfg.processor.gripper.use_gripper
+                    if cfg.processor.gripper is not None
+                    else False,
+                ),
+                MapDeltaActionToRobotActionStep(),
+                EEReferenceAndDelta(
+                    kinematics=kinematics_solver,
+                    end_effector_step_sizes=cfg.processor.inverse_kinematics.end_effector_step_sizes,
+                    motor_names=motor_names,
+                    use_latched_reference=False,
+                    use_ik_solution=True,
+                ),
+                EEBoundsAndSafety(
+                    end_effector_bounds=cfg.processor.inverse_kinematics.end_effector_bounds,
+                ),
+                GripperVelocityToJoint(
+                    clip_max=cfg.processor.max_gripper_pos,
+                    speed_factor=1.0,
+                    discrete_gripper=True,
+                ),
+                InverseKinematicsRLStep(
+                    kinematics=kinematics_solver,
+                    motor_names=motor_names,
+                    initial_guess_current_joints=False,
+                ),
+                RobotActionToPolicyActionProcessorStep(
+                    motor_names=motor_names,
+                    leader_joint_override_key="leader_joint_action",
+                ),
+            ]
         )
-        leader_follow_policy = bool(
-            getattr(getattr(teleop_device, "config", None), "leader_follow_policy", False)
-        )
-        if not leader_always_intervenes or leader_follow_policy:
-            action_pipeline_steps.extend(
-                [
-                    MapTensorToDeltaActionDictStep(
-                        use_gripper=cfg.processor.gripper.use_gripper
-                        if cfg.processor.gripper is not None
-                        else False,
-                        passthrough_non_policy_action=True,
-                    ),
-                    MapDeltaActionToRobotActionStep(passthrough_non_delta_action=True),
-                    EEReferenceAndDelta(
-                        kinematics=kinematics_solver,
-                        end_effector_step_sizes=cfg.processor.inverse_kinematics.end_effector_step_sizes,
-                        motor_names=motor_names,
-                        use_latched_reference=False,
-                        use_ik_solution=True,
-                        passthrough_non_delta_action=True,
-                    ),
-                    EEBoundsAndSafety(
-                        end_effector_bounds=cfg.processor.inverse_kinematics.end_effector_bounds,
-                        passthrough_non_ee_action=True,
-                    ),
-                    GripperVelocityToJoint(
-                        clip_max=cfg.processor.max_gripper_pos,
-                        speed_factor=1.0,
-                        discrete_gripper=True,
-                        passthrough_if_gripper_pos_exists=True,
-                        passthrough_non_ee_action=True,
-                    ),
-                    InverseKinematicsRLStep(
-                        kinematics=kinematics_solver,
-                        motor_names=motor_names,
-                        initial_guess_current_joints=False,
-                        passthrough_non_ee_action=True,
-                    ),
-                ]
-            )
-        action_pipeline_steps.append(RobotActionToPolicyActionProcessorStep(motor_names=motor_names))
     # 使用键盘ee作为teleop设备时
     elif cfg.processor.inverse_kinematics is not None and kinematics_solver is not None:
         # Add EE bounds and safety processor
