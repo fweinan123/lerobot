@@ -671,6 +671,7 @@ class InterventionActionProcessorStep(ProcessorStep):
         rerecord_episode   = info.get(TeleopEvents.RERECORD_EPISODE, False)
 
         new_transition = transition.copy()
+        complementary_data = dict(new_transition.get(TransitionKey.COMPLEMENTARY_DATA, {}))
 
         # Override action if intervention is active
         if is_intervention and self.teleop_action_mode == "joint":
@@ -687,7 +688,6 @@ class InterventionActionProcessorStep(ProcessorStep):
                 f"{name}.pos": float(teleop_action[f"{name}.pos"]) for name in self.motor_names
             }
 
-            complementary_data = dict(new_transition.get(TransitionKey.COMPLEMENTARY_DATA, {}))
             complementary_data[LEADER_JOINT_ACTION_KEY] = joint_action
             new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
             new_transition[TransitionKey.ACTION] = self._leader_joint_action_to_delta_tensor(
@@ -697,6 +697,8 @@ class InterventionActionProcessorStep(ProcessorStep):
                 device=action.device,
             )
         elif is_intervention and self.teleop_action_mode == "delta" and teleop_action is not None:
+            complementary_data.pop(LEADER_JOINT_ACTION_KEY, None)
+            new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
             if isinstance(teleop_action, dict):
                 # Convert teleop_action dict to tensor format
                 action_list = [
@@ -715,6 +717,9 @@ class InterventionActionProcessorStep(ProcessorStep):
             new_transition[TransitionKey.ACTION] = teleop_action_tensor
         elif self.teleop_action_mode not in {"delta", "joint"}:
             raise ValueError(f"Unsupported teleop_action_mode: {self.teleop_action_mode}")
+        else:
+            complementary_data.pop(LEADER_JOINT_ACTION_KEY, None)
+            new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
 
         # Handle episode termination
         new_transition[TransitionKey.DONE] = bool(terminate_episode) or (

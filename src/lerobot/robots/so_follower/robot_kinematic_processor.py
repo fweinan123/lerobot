@@ -31,6 +31,7 @@ from lerobot.processor import (
     RobotObservation,
     TransitionKey,
 )
+from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.utils.rotation import Rotation
 
 
@@ -155,7 +156,8 @@ class EEReferenceAndDelta(RobotActionProcessorStep):
             if self._command_when_disabled is None:
                 # If we've never had an enabled command yet, freeze current FK pose once.
                 self._command_when_disabled = t_curr.copy()
-            desired = self._command_when_disabled.copy()
+            # desired = self._command_when_disabled.copy()
+            desired = t_curr.copy() 
 
         # Write action fields
         pos = desired[:3, 3]
@@ -695,7 +697,19 @@ class InverseKinematicsRLStep(ProcessorStep):
 
         new_transition[TransitionKey.ACTION] = action
         complementary_data = new_transition.get(TransitionKey.COMPLEMENTARY_DATA, {})
-        complementary_data["IK_solution"] = q_target
+        leader_joint_action = complementary_data.get("leader_joint_action")
+        info = new_transition.get(TransitionKey.INFO, {})
+        is_intervention = bool(info.get(TeleopEvents.IS_INTERVENTION, False))
+        if is_intervention and leader_joint_action is not None:
+            ik_solution = np.array(
+                [float(leader_joint_action[f"{name}.pos"]) for name in self.motor_names],
+                dtype=float,
+            )
+            self.q_curr = ik_solution
+        else:
+            ik_solution = q_target
+
+        complementary_data["IK_solution"] = ik_solution
         new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
         return new_transition
 
