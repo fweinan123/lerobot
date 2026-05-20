@@ -543,7 +543,10 @@ class AddRecordActionAsComplementaryDataStep(ProcessorStep):
         else:
             raise ValueError(f"Unsupported action type for record_action: {type(action)}")
 
-        new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
+        # 如果是policy，则将policy的输出保存tenosr，如果是Leader遥操
+        # 则将转换成delta的tensor，如果是keyboard ee，则转换成tensor
+        # 也就是不管怎么样，COMPLEMENTARY_DATA中的RECORD_ACTION_KEY里面记录的就是数据集需要储下来的action
+        new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data   
         return new_transition
 
     def transform_features(
@@ -589,13 +592,15 @@ class InterventionActionProcessorStep(ProcessorStep):
             raise ValueError(f"Action should be a PolicyAction type got {type(action)}")
 
         # Get intervention signals from complementary data
-        info = transition.get(TransitionKey.INFO, {})
         complementary_data = transition.get(TransitionKey.COMPLEMENTARY_DATA, {})
         teleop_action = complementary_data.get(TELEOP_ACTION_KEY, {})
-        is_intervention = info.get(TeleopEvents.IS_INTERVENTION, False)
-        terminate_episode = info.get(TeleopEvents.TERMINATE_EPISODE, False)
-        success = info.get(TeleopEvents.SUCCESS, False)
-        rerecord_episode = info.get(TeleopEvents.RERECORD_EPISODE, False)
+
+        # Get intervention signals from info
+        info               = transition.get(TransitionKey.INFO, {})
+        is_intervention    = info.get(TeleopEvents.IS_INTERVENTION, False)
+        terminate_episode  = info.get(TeleopEvents.TERMINATE_EPISODE, False)
+        success            = info.get(TeleopEvents.SUCCESS, False)
+        rerecord_episode   = info.get(TeleopEvents.RERECORD_EPISODE, False)
 
         new_transition = transition.copy()
 
@@ -609,8 +614,8 @@ class InterventionActionProcessorStep(ProcessorStep):
             missing = [f"{name}.pos" for name in self.motor_names if f"{name}.pos" not in teleop_action]
             if missing:
                 raise ValueError(f"Missing joint action keys for joint teleop mode: {missing}")
-
-            new_transition[TransitionKey.ACTION] = {
+            # 如果是Leader遥操时，则已经将transition[action]转换成了6jonint的字典
+            new_transition[TransitionKey.ACTION] = {  
                 f"{name}.pos": float(teleop_action[f"{name}.pos"]) for name in self.motor_names
             }
         elif is_intervention and self.teleop_action_mode == "delta" and teleop_action is not None:
@@ -641,14 +646,14 @@ class InterventionActionProcessorStep(ProcessorStep):
 
         # Update info with intervention metadata
         info = new_transition.get(TransitionKey.INFO, {})
-        info[TeleopEvents.IS_INTERVENTION] = is_intervention
+        info[TeleopEvents.IS_INTERVENTION]  = is_intervention
         info[TeleopEvents.RERECORD_EPISODE] = rerecord_episode
-        info[TeleopEvents.SUCCESS] = success
-        new_transition[TransitionKey.INFO] = info
+        info[TeleopEvents.SUCCESS]          = success
+        new_transition[TransitionKey.INFO]  = info
 
         # Update complementary data with teleop action
         complementary_data = new_transition.get(TransitionKey.COMPLEMENTARY_DATA, {})
-        complementary_data[TELEOP_ACTION_KEY] = new_transition.get(TransitionKey.ACTION)
+        complementary_data[TELEOP_ACTION_KEY] = new_transition.get(TransitionKey.ACTION)  # 如果是遥操模式，则是遥操动作，如果是policy模式，则是原始动作（tensor）
         new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
 
         return new_transition

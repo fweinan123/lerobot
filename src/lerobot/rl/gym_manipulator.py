@@ -543,8 +543,8 @@ def make_processors(
         raise ValueError("SO leader teleop requires inverse_kinematics config to record EE delta actions.")
 
     action_pipeline_steps = [
-        AddTeleopActionAsComplimentaryDataStep(teleop_device=teleop_device),  #  teleop 设备读取当前人工输入
-        AddTeleopEventsAsInfoStep(teleop_device=teleop_device),   # 读取 teleop 事件：是否正在人工干预，是否终止当前 episode，是否成功，是否需要重录等
+        AddTeleopActionAsComplimentaryDataStep(teleop_device=teleop_device),  #  teleop_device.get_action()存在complementary_data[TELEOP_ACTION_KEY]
+        AddTeleopEventsAsInfoStep(teleop_device=teleop_device),   # teleop_device.get_teleop_events()读取 teleop 事件：是否正在人工干预，是否终止当前 episode，是否成功，是否需要重录等
         InterventionActionProcessorStep(   # 如果是人工干预，则将tele的action替换原来的action，并根据事件设置done/reward等
             use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False,
             terminate_on_success=terminate_on_success,
@@ -672,10 +672,15 @@ def step_env_and_process_transition(
     transition[TransitionKey.OBSERVATION] = (
         env.get_raw_joint_positions() if hasattr(env, "get_raw_joint_positions") else {}
     )
-    processed_action_transition = action_processor(transition)
-    processed_action = processed_action_transition[TransitionKey.ACTION]
 
+    # 进行action_processor流程
+    processed_action_transition = action_processor(transition)
+
+    # 取出action_processor处理后的动作和信息
+    processed_action = processed_action_transition[TransitionKey.ACTION]
     action_info = processed_action_transition[TransitionKey.INFO]
+
+    # 判断当前动作是否来自人工干预，以及是否需要让Leader跟随策略动作（如果使用 SO 领导者模式的 teleop 输出关节位置，则默认领导者总
     is_intervention = bool(action_info.get(TeleopEvents.IS_INTERVENTION, False))
     leader_follow_policy = bool(
         teleop_device is not None
@@ -689,6 +694,7 @@ def step_env_and_process_transition(
         }
         teleop_device.send_feedback(feedback)
 
+    # 环境交互，执行动作并获取新的环境反馈
     obs, reward, terminated, truncated, info = env.step(processed_action)
 
     reward = reward + processed_action_transition[TransitionKey.REWARD]
@@ -894,7 +900,7 @@ def control_loop(
                 # Reset for new episode
                 transition = reset_and_build_transition(env, env_processor, action_processor)
 
-            # Maintain fps timing
+            # Maintain fps timing，保证每一步的执行时间接近 cfg.env.fps 定义的频率
             precise_sleep(max(dt - (time.perf_counter() - step_start_time), 0.0))
     except KeyboardInterrupt:
         logging.info("Interrupted by user; shutting down cleanly")
