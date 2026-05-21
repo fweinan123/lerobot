@@ -566,71 +566,49 @@ def make_processors(
         ),
     ]
 
-    # 使用Leader作为teleop设备时
-    if teleop_outputs_joint_positions:
-        action_pipeline_steps.extend(
-            [
-                MapTensorToDeltaActionDictStep(
-                    use_gripper=cfg.processor.gripper.use_gripper
-                    if cfg.processor.gripper is not None
-                    else False,
-                ),
-                MapDeltaActionToRobotActionStep(),
-                EEReferenceAndDelta(
-                    kinematics=kinematics_solver,
-                    end_effector_step_sizes=cfg.processor.inverse_kinematics.end_effector_step_sizes,
-                    motor_names=motor_names,
-                    use_latched_reference=False,
-                    use_ik_solution=True,
-                ),
-                EEBoundsAndSafety(
-                    end_effector_bounds=cfg.processor.inverse_kinematics.end_effector_bounds,
-                ),
-                GripperVelocityToJoint(
-                    clip_max=cfg.processor.max_gripper_pos,
-                    speed_factor=1.0,
-                    discrete_gripper=True,
-                ),
-                InverseKinematicsRLStep(
-                    kinematics=kinematics_solver,
-                    motor_names=motor_names,
-                    initial_guess_current_joints=False,
-                ),
-                RobotActionToPolicyActionProcessorStep(
-                    motor_names=motor_names,
-                    leader_joint_override_key="leader_joint_action",
-                ),
-            ]
+    if cfg.processor.inverse_kinematics is None or kinematics_solver is None:
+        raise ValueError(
+            "inverse_kinematics config is required for gym_manipulator action processing. "
+            "Policy and teleop actions are represented as end-effector deltas and must be "
+            "converted to follower joint targets through the EE/IK action pipeline."
         )
-    # 使用键盘ee作为teleop设备时
-    elif cfg.processor.inverse_kinematics is not None and kinematics_solver is not None:
-        # Add EE bounds and safety processor
-        inverse_kinematics_steps = [
+
+    action_pipeline_steps.extend(
+        [
             MapTensorToDeltaActionDictStep(
-                use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False,
+                use_gripper=cfg.processor.gripper.use_gripper
+                if cfg.processor.gripper is not None
+                else False,
             ),
-            MapDeltaActionToRobotActionStep(),  # 把 delta action 改成 EE 控制格式
-            EEReferenceAndDelta(                # 相对 EE 增量变成绝对 EE 目标位姿
+            MapDeltaActionToRobotActionStep(),
+            EEReferenceAndDelta(
                 kinematics=kinematics_solver,
                 end_effector_step_sizes=cfg.processor.inverse_kinematics.end_effector_step_sizes,
                 motor_names=motor_names,
                 use_latched_reference=False,
                 use_ik_solution=True,
             ),
-            EEBoundsAndSafety(                  # 对 EE 目标位置做安全限制
+            EEBoundsAndSafety(
                 end_effector_bounds=cfg.processor.inverse_kinematics.end_effector_bounds,
             ),
-            GripperVelocityToJoint(             # 把 gripper 的速度/离散命令转换成目标夹爪关节位置
+            GripperVelocityToJoint(
                 clip_max=cfg.processor.max_gripper_pos,
                 speed_factor=1.0,
                 discrete_gripper=True,
             ),
-            InverseKinematicsRLStep(            # 把目标 EE 位姿转换成关节目标
-                kinematics=kinematics_solver, motor_names=motor_names, initial_guess_current_joints=False
+            InverseKinematicsRLStep(
+                kinematics=kinematics_solver,
+                motor_names=motor_names,
+                initial_guess_current_joints=False,
+            ),
+            RobotActionToPolicyActionProcessorStep(
+                motor_names=motor_names,
+                leader_joint_override_key="leader_joint_action"
+                if teleop_outputs_joint_positions
+                else None,
             ),
         ]
-        action_pipeline_steps.extend(inverse_kinematics_steps)
-        action_pipeline_steps.append(RobotActionToPolicyActionProcessorStep(motor_names=motor_names))
+    )
 
     return DataProcessorPipeline(
         steps=env_pipeline_steps, to_transition=identity_transition, to_output=identity_transition
