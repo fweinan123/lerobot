@@ -15,6 +15,8 @@
 # limitations under the License.
 
 import logging
+import math
+from pathlib import Path
 import time
 from typing import Any
 
@@ -63,6 +65,12 @@ class OpenArmLeader(Teleoperator):
             bitrate=self.config.can_bitrate,
             data_bitrate=self.config.can_data_bitrate if self.config.use_can_fd else None,
         )
+        self._pin = None
+        self._pin_model = None
+        self._pin_data = None
+        self._pin_q = None
+        self._pin_joint_q_indices: dict[str, int] = {}
+        self._pin_joint_v_indices: dict[str, int] = {}
 
     @property
     def action_features(self) -> dict[str, type]:
@@ -178,6 +186,86 @@ class OpenArmLeader(Teleoperator):
 
         return self.bus.disable_torque() if self.config.manual_control else self.bus.configure_motors()
 
+    def _normalized_side(self) -> str:
+        side = self.config.side or "right"
+        side = side.removesuffix("_arm")
+        if side not in {"left", "right"}:
+            raise ValueError("OpenArm leader side must be 'left', 'right', 'left_arm', or 'right_arm'.")
+        return side
+
+    def _load_pinocchio_model(self) -> None:
+        if self._pin_model is not None:
+            return
+
+        if self.config.gravity_compensation_urdf_path is None:
+            raise ValueError("gravity_compensation_urdf_path must be set when gravity compensation is enabled.")
+
+        urdf_path = Path(self.config.gravity_compensation_urdf_path)
+        if not urdf_path.is_file():
+            raise FileNotFoundError(f"OpenArm leader gravity compensation URDF not found: {urdf_path}")
+
+        try:
+            import pinocchio as pin
+        except ImportError as e:
+            raise ImportError(
+                "OpenArm leader gravity compensation requires Pinocchio. Install it before running "
+                "with --teleop.manual_control=false."
+            ) from e
+
+        if not hasattr(pin, "RobotWrapper") and not hasattr(pin, "buildModelFromUrdf"):
+            raise ImportError(
+                "The imported 'pinocchio' package is not the robotics Pinocchio library. "
+                "Install the correct package with: conda install -c conda-forge pinocchio"
+            )
+
+        self._pin = pin
+        if hasattr(pin, "buildModelFromUrdf"):
+            self._pin_model = pin.buildModelFromUrdf(str(urdf_path))
+        else:
+            self._pin_model = pin.RobotWrapper.BuildFromURDF(str(urdf_path)).model
+        self._pin_data = self._pin_model.createData()
+        self._pin_q = pin.neutral(self._pin_model)
+
+        side = self._normalized_side()
+        for idx in range(1, 8):
+            motor_name = f"joint_{idx}"
+            urdf_joint_name = f"openarm_{side}_joint{idx}"
+            joint_id = self._pin_model.getJointId(urdf_joint_name)
+            if joint_id == 0:
+                raise ValueError(f"Joint '{urdf_joint_name}' was not found in {urdf_path}.")
+            self._pin_joint_q_indices[motor_name] = self._pin_model.idx_qs[joint_id]
+            self._pin_joint_v_indices[motor_name] = self._pin_model.idx_vs[joint_id]
+
+        logger.info("Loaded OpenArm leader Pinocchio model from %s for %s arm.", urdf_path, side)
+
+    def _apply_gravity_compensation(self, states: dict[str, Any]) -> None:
+        if self.config.manual_control or not self.config.gravity_compensation:
+            return
+
+        self._load_pinocchio_model()
+        if self._pin is None or self._pin_model is None or self._pin_data is None or self._pin_q is None:
+            raise RuntimeError("Pinocchio model was not initialized.")
+
+        for motor_name, q_index in self._pin_joint_q_indices.items():
+            position_deg = states.get(motor_name, {}).get("position")
+            if position_deg is None:
+                logger.debug("Skipping gravity compensation; missing position for %s.", motor_name)
+                return
+            self._pin_q[q_index] = math.radians(float(position_deg))
+
+        gravity = self._pin.computeGeneralizedGravity(self._pin_model, self._pin_data, self._pin_q)
+
+        commands = {}
+        for motor_name in self.bus.motors:
+            if motor_name == "gripper":
+                commands[motor_name] = (0.0, 0.0, 0.0, 0.0, 0.0)
+                continue
+
+            v_index = self._pin_joint_v_indices[motor_name]
+            commands[motor_name] = (0.0, 0.0, 0.0, 0.0, float(gravity[v_index]))
+
+        self.bus._mit_control_batch(commands)
+
     def setup_motors(self) -> None:
         raise NotImplementedError(
             "Motor ID configuration is typically done via manufacturer tools for CAN motors."
@@ -199,6 +287,7 @@ class OpenArmLeader(Teleoperator):
 
         # Use sync_read_all_states to get pos/vel/torque in one go
         states = self.bus.sync_read_all_states()
+        self._apply_gravity_compensation(states)
         for motor in self.bus.motors:
             state = states.get(motor, {})
             action_dict[f"{motor}.pos"] = state.get("position")
@@ -219,6 +308,5 @@ class OpenArmLeader(Teleoperator):
         """Disconnect from teleoperator."""
 
         # Disconnect CAN bus
-        # For manual control, ensure torque is disabled before disconnecting
-        self.bus.disconnect(disable_torque=self.config.manual_control)
+        self.bus.disconnect(disable_torque=self.config.disable_torque_on_disconnect)
         logger.info(f"{self} disconnected.")

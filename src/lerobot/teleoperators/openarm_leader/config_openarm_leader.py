@@ -60,6 +60,17 @@ class OpenArmLeaderConfigBase:
     # When enabled, motors have torque disabled for manual movement
     manual_control: bool = True
 
+    # Whether to disable torque when disconnecting.
+    disable_torque_on_disconnect: bool = True
+
+    # Arm side used to select the matching Pinocchio joint chain for gravity compensation.
+    # Accepts "left", "right", "left_arm", or "right_arm". Defaults to right when unset.
+    side: str | None = None
+
+    # When manual_control is False, continuously send Pinocchio gravity compensation torques.
+    gravity_compensation: bool = True
+    gravity_compensation_urdf_path: str | None = "/home/linx-06/lerobot/urdf/openarm_leader.urdf"
+
     # When True, expose `.vel` and `.torque` per motor in action features.
     # Default False for compatibility with the position-only openarm_mini teleoperator.
     use_velocity_and_torque: bool = False
