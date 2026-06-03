@@ -115,9 +115,6 @@ class OpenArmLeader(Teleoperator):
 
         self.configure()
 
-        if self.is_calibrated:
-            self.bus.set_zero_position()
-
         logger.info(f"{self} connected.")
 
     @property
@@ -307,6 +304,6 @@ class OpenArmLeader(Teleoperator):
     def disconnect(self) -> None:
         """Disconnect from teleoperator."""
 
-        # Disconnect CAN bus
+        # Disconnect CAN bus.
         self.bus.disconnect(disable_torque=self.config.disable_torque_on_disconnect)
         logger.info(f"{self} disconnected.")

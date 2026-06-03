@@ -101,7 +101,11 @@ class BiOpenArmLeader(Teleoperator):
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
         self.left_arm.connect(calibrate)
-        self.right_arm.connect(calibrate)
+        try:
+            self.right_arm.connect(calibrate)
+        except Exception:
+            self.left_arm.disconnect()
+            raise
 
     @property
     def is_calibrated(self) -> bool:

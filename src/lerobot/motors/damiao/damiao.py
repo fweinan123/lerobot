@@ -198,6 +198,13 @@ class DamiaoMotorsBus(MotorsBusBase):
 
             logger.debug(f"{self.__class__.__name__} connected via {self.can_interface}.")
         except Exception as e:
+            if self.canbus is not None:
+                try:
+                    self.canbus.shutdown()
+                except Exception as shutdown_error:
+                    logger.warning(f"Failed to shut down CAN bus after connection error: {shutdown_error}")
+                finally:
+                    self.canbus = None
             self._is_connected = False
             raise ConnectionError(f"Failed to connect to CAN bus: {e}") from e
 

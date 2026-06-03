@@ -145,9 +145,6 @@ class OpenArmFollower(Robot):
 
         self.configure()
 
-        if self.is_calibrated:
-            self.bus.set_zero_position()
-
         self.bus.enable_torque()
 
         logger.info(f"{self} connected.")

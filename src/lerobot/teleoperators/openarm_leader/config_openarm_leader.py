@@ -58,9 +58,10 @@ class OpenArmLeaderConfigBase:
 
     # Torque mode settings for manual control
     # When enabled, motors have torque disabled for manual movement
+    # 如果false，电机会持续发送引力补偿扭矩进行重力补偿，所以重力补偿的状态下需要设置为false
     manual_control: bool = True
 
-    # Whether to disable torque when disconnecting.
+    # Whether to disable torque when disconnecting. 默认是True不需要修改，每次退出时关闭torque
     disable_torque_on_disconnect: bool = True
 
     # Arm side used to select the matching Pinocchio joint chain for gravity compensation.

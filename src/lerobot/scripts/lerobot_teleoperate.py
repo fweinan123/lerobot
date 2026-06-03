@@ -221,10 +221,10 @@ def teleoperate(cfg: TeleoperateConfig):
     robot = make_robot_from_config(cfg.robot)
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
 
-    teleop.connect()
-    robot.connect()
-
     try:
+        teleop.connect()
+        robot.connect()
+
         teleop_loop(
             teleop=teleop,
             robot=robot,
@@ -241,8 +241,10 @@ def teleoperate(cfg: TeleoperateConfig):
     finally:
         if cfg.display_data:
             shutdown_rerun()
-        teleop.disconnect()
-        robot.disconnect()
+        if teleop.is_connected:
+            teleop.disconnect()
+        if robot.is_connected:
+            robot.disconnect()
 
 
 def main():
