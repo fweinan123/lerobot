@@ -133,6 +133,9 @@ class TrainPipelineConfig(HubMixin):
         return self.policy  # type: ignore[return-value]
 
     def validate(self) -> None:
+        self._validate(check_output_dir=True)
+
+    def _validate(self, *, check_output_dir: bool) -> None:
         # HACK: We parse again the cli args here to get the pretrained paths if there was some.
         policy_path = parser.get_path_arg("policy")
         reward_model_path = parser.get_path_arg("reward_model")
@@ -183,11 +186,8 @@ class TrainPipelineConfig(HubMixin):
             else:
                 self.job_name = f"{self.env.type}_{active_cfg.type}"
 
-        if not self.resume and isinstance(self.output_dir, Path) and self.output_dir.is_dir():
-            raise FileExistsError(
-                f"Output directory {self.output_dir} already exists and resume is {self.resume}. "
-                f"Please change your output directory so that {self.output_dir} is not overwritten."
-            )
+        if check_output_dir:
+            self.validate_output_dir()
         elif not self.output_dir:
             now = dt.datetime.now()
             train_dir = f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{self.job_name}"
@@ -204,6 +204,17 @@ class TrainPipelineConfig(HubMixin):
 
         if hasattr(active_cfg, "push_to_hub") and active_cfg.push_to_hub and not active_cfg.repo_id:
             raise ValueError("'repo_id' argument missing. Please specify it to push the model to the hub.")
+
+    def validate_output_dir(self) -> None:
+        if not self.resume and isinstance(self.output_dir, Path) and self.output_dir.is_dir():
+            raise FileExistsError(
+                f"Output directory {self.output_dir} already exists and resume is {self.resume}. "
+                f"Please change your output directory so that {self.output_dir} is not overwritten."
+            )
+        elif not self.output_dir:
+            now = dt.datetime.now()
+            train_dir = f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{self.job_name}"
+            self.output_dir = Path("outputs/train") / train_dir
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:

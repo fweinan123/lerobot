@@ -22,6 +22,7 @@ import dataclasses
 import logging
 import time
 from contextlib import nullcontext
+from pathlib import Path
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
 
@@ -60,6 +61,37 @@ from lerobot.utils.utils import (
 )
 
 from .lerobot_eval import eval_policy_all
+
+
+def _validate_output_dir_distributed(cfg: TrainPipelineConfig, accelerator: "Accelerator") -> None:
+    """Validate output_dir on rank 0 and propagate the result to all workers."""
+    result: list[dict[str, str | None]] = [{"error_type": None, "error_message": None, "output_dir": None}]
+
+    if accelerator.is_main_process:
+        try:
+            cfg.validate_output_dir()
+            result[0]["output_dir"] = str(cfg.output_dir) if cfg.output_dir is not None else None
+        except Exception as exc:
+            result[0] = {
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+                "output_dir": str(cfg.output_dir) if cfg.output_dir is not None else None,
+            }
+
+    if accelerator.num_processes > 1:
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            raise RuntimeError("Distributed training is active, but torch.distributed is not initialized.")
+        torch.distributed.broadcast_object_list(result, src=0)
+
+    output_dir = result[0]["output_dir"]
+    if output_dir is not None:
+        cfg.output_dir = Path(output_dir)
+
+    error_message = result[0]["error_message"]
+    if error_message is not None:
+        if result[0]["error_type"] == "FileExistsError":
+            raise FileExistsError(error_message)
+        raise RuntimeError(error_message)
 
 
 def update_policy(
@@ -182,7 +214,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     require_package("accelerate", extra="training")
     from accelerate import Accelerator
 
-    cfg.validate()
+    cfg._validate(check_output_dir=False)
 
     # Create Accelerator if not provided
     # It will automatically detect if running in distributed mode or single-process mode
@@ -206,6 +238,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     # Determine if this is the main process (for logging and checkpointing)
     # When using accelerate, only the main process should log to avoid duplicate outputs
     is_main_process = accelerator.is_main_process
+    _validate_output_dir_distributed(cfg, accelerator)
+    accelerator.wait_for_everyone()
 
     # Only log on main process
     if is_main_process:
