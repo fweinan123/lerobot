@@ -1,0 +1,4 @@
+{
+  "observation.images.top": [80,360,630,630],
+  "observation.images.head": [100,320,600,800]
+}
