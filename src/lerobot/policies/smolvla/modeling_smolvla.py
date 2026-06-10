@@ -155,6 +155,20 @@ def resize_with_pad(img, width, height, pad_value=-1):
     return padded_img
 
 
+def crop_image(img: Tensor, key: str, crop_params: tuple[int, int, int, int]) -> Tensor:
+    top, left, height, width = crop_params
+    if height <= 0 or width <= 0:
+        raise ValueError(f"Invalid crop for {key}: height and width must be positive. Got {crop_params}.")
+
+    _, _, img_height, img_width = img.shape
+    if top < 0 or left < 0 or top + height > img_height or left + width > img_width:
+        raise ValueError(
+            f"Invalid crop for {key}: {crop_params} is outside image shape {tuple(img.shape)}."
+        )
+
+    return img[:, :, top : top + height, left : left + width]
+
+
 def pad_vector(vector, new_dim):
     """Can be (batch_size x sequence_length x features_dimension)
     or (batch_size x features_dimension)
@@ -428,6 +442,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
         # Preprocess image features present in the batch
         for key in present_img_keys:
             img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
+            if self.config.image_crop_params is not None and key in self.config.image_crop_params:
+                img = crop_image(img, key, self.config.image_crop_params[key])
             if self.config.resize_imgs_with_padding is not None:
                 img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
 
@@ -452,6 +468,17 @@ class SmolVLAPolicy(PreTrainedPolicy):
             mask = torch.zeros_like(mask)
             images.append(img)
             img_masks.append(mask)
+        
+        # from pathlib import Path
+        # from torchvision.utils import save_image
+        # debug_dir = Path("outputs/debug_smolvla_roi")
+        # debug_dir.mkdir(parents=True, exist_ok=True)
+        # for i, img in enumerate(images):
+        #     vis_img = (img[0].detach().cpu() + 1.0) / 2.0
+        #     vis_img = vis_img.clamp(0.0, 1.0)
+        #     save_image(vis_img, debug_dir / f"camera_{i}.png")
+        # exit(-1)
+
         return images, img_masks
 
     def _pi_aloha_decode_state(self, state):

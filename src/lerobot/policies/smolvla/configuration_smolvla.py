@@ -43,6 +43,8 @@ class SmolVLAConfig(PreTrainedConfig):
 
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
+    # Optional per-image crop before resize/padding. Format: key -> (top, left, height, width).
+    image_crop_params: dict[str, tuple[int, int, int, int]] | None = None
 
     # Add empty images. Used by smolvla_aloha_sim which adds the empty
     # left and right wrist cameras in addition to the top camera.

@@ -166,6 +166,16 @@ wandb/
 data/
 outputs/
 
+# Image files
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
+*.webp
+*.tif
+*.tiff
+
 # Translations
 *.mo
 *.pot
