@@ -125,7 +125,7 @@ def init_keyboard_listener():
     """
     Initializes a non-blocking keyboard listener for real-time user interaction.
 
-    This function sets up a listener for specific keys (right arrow, left arrow, escape) to control
+    This function sets up a listener for specific keys (space, right arrow, left arrow, escape) to control
     the program flow during execution, such as stopping recording or exiting loops. It gracefully
     handles headless environments where keyboard listening is not possible.
 
@@ -141,6 +141,7 @@ def init_keyboard_listener():
     events["exit_early"] = False
     events["rerecord_episode"] = False
     events["stop_recording"] = False
+    events["start_recording_episode"] = False
 
     if is_headless():
         logging.warning(
@@ -157,6 +158,9 @@ def init_keyboard_listener():
             if key == keyboard.Key.right:
                 print("Right arrow key pressed. Exiting loop...")
                 events["exit_early"] = True
+            elif key == keyboard.Key.space:
+                print("Space key pressed. Starting episode recording...")
+                events["start_recording_episode"] = True
             elif key == keyboard.Key.left:
                 print("Left arrow key pressed. Exiting loop and rerecord the last episode...")
                 events["rerecord_episode"] = True

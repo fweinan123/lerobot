@@ -342,6 +342,15 @@ def record_loop(
         timestamp = time.perf_counter() - start_episode_t
 
 
+def wait_for_episode_start(events: dict, play_sounds: bool) -> None:
+    """Block before recording an episode until the user presses space."""
+    events["start_recording_episode"] = False
+    log_say("Press space to start recording episode", play_sounds)
+    while not events["start_recording_episode"] and not events["stop_recording"]:
+        precise_sleep(0.05)
+    events["start_recording_episode"] = False
+
+
 @parser.wrap()
 def record(
     cfg: RecordConfig,
@@ -447,6 +456,10 @@ def record(
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
+                wait_for_episode_start(events, cfg.play_sounds)
+                if events["stop_recording"]:
+                    break
+
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
                 record_loop(
                     robot=robot,

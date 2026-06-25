@@ -39,6 +39,40 @@ from ..pretrained import PreTrainedPolicy
 from .configuration_act import ACTConfig
 
 
+def resize_with_pad(img: Tensor, width: int, height: int, pad_value: float = 0.0) -> Tensor:
+    if img.ndim != 4:
+        raise ValueError(f"(b,c,h,w) expected, but {img.shape}")
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Resize width and height must be positive. Got {(width, height)}.")
+
+    cur_height, cur_width = img.shape[2:]
+    ratio = max(cur_width / width, cur_height / height)
+    resized_height = int(cur_height / ratio)
+    resized_width = int(cur_width / ratio)
+    resized_img = F.interpolate(
+        img, size=(resized_height, resized_width), mode="bilinear", align_corners=False
+    )
+
+    pad_height = max(0, int(height - resized_height))
+    pad_width = max(0, int(width - resized_width))
+
+    return F.pad(resized_img, (pad_width, 0, pad_height, 0), value=pad_value)
+
+
+def crop_image(img: Tensor, key: str, crop_params: tuple[int, int, int, int]) -> Tensor:
+    top, left, height, width = crop_params
+    if height <= 0 or width <= 0:
+        raise ValueError(f"Invalid crop for {key}: height and width must be positive. Got {crop_params}.")
+
+    _, _, img_height, img_width = img.shape
+    if top < 0 or left < 0 or top + height > img_height or left + width > img_width:
+        raise ValueError(
+            f"Invalid crop for {key}: {crop_params} is outside image shape {tuple(img.shape)}."
+        )
+
+    return img[:, :, top : top + height, left : left + width]
+
+
 class ACTPolicy(PreTrainedPolicy):
     """
     Action Chunking Transformer Policy as per Learning Fine-Grained Bimanual Manipulation with Low-Cost
@@ -97,6 +131,26 @@ class ACTPolicy(PreTrainedPolicy):
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
 
+    def _prepare_images(self, batch: dict[str, Tensor]) -> list[Tensor]:
+        images = []
+        image_shapes = set()
+        for key in self.config.image_features:
+            img = batch[key]
+            if self.config.image_crop_params is not None and key in self.config.image_crop_params:
+                img = crop_image(img, key, self.config.image_crop_params[key])
+            if self.config.resize_imgs_with_padding is not None:
+                img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0.0)
+            images.append(img)
+            image_shapes.add(tuple(img.shape[-2:]))
+
+        if len(image_shapes) > 1:
+            raise ValueError(
+                "ACT requires all image features to have the same height and width after image preprocessing. "
+                f"Got shapes: {sorted(image_shapes)}."
+            )
+
+        return images
+
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations.
@@ -129,7 +183,7 @@ class ACTPolicy(PreTrainedPolicy):
 
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+            batch[OBS_IMAGES] = self._prepare_images(batch)
 
         actions = self.model(batch)[0]
         return actions
@@ -138,7 +192,7 @@ class ACTPolicy(PreTrainedPolicy):
         """Run the batch through the model and compute the loss for training or validation."""
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+            batch[OBS_IMAGES] = self._prepare_images(batch)
 
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
 

@@ -42,6 +42,8 @@ lerobot-replay \
 """
 
 import logging
+import math
+from numbers import Real
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -94,6 +96,9 @@ class ReplayConfig:
     dataset: DatasetReplayConfig
     # Use vocal synthesis to read events.
     play_sounds: bool = True
+    # Move the robot gradually from its current pose to the first episode action before replaying.
+    # Set to 0 to start replay immediately.
+    move_to_start_time_s: float = 2.0
 
 
 @parser.wrap()
@@ -111,14 +116,25 @@ def replay(cfg: ReplayConfig):
     robot.connect()
 
     try:
+        if cfg.move_to_start_time_s < 0:
+            raise ValueError("move_to_start_time_s must be greater than or equal to 0.")
+
+        if cfg.move_to_start_time_s > 0 and dataset.num_frames > 0:
+            log_say("Moving to episode start", cfg.play_sounds, blocking=True)
+            first_action = _dataset_action_to_robot_action(dataset, actions, 0)
+            _move_to_start_pose(
+                robot=robot,
+                robot_action_processor=robot_action_processor,
+                target_action=first_action,
+                move_time_s=cfg.move_to_start_time_s,
+                fps=dataset.fps,
+            )
+
         log_say("Replaying episode", cfg.play_sounds, blocking=True)
         for idx in range(dataset.num_frames):
             start_episode_t = time.perf_counter()
 
-            action_array = actions[idx][ACTION]
-            action = {}
-            for i, name in enumerate(dataset.features[ACTION]["names"]):
-                action[name] = action_array[i]
+            action = _dataset_action_to_robot_action(dataset, actions, idx)
 
             robot_obs = robot.get_observation()
 
@@ -130,6 +146,53 @@ def replay(cfg: ReplayConfig):
             precise_sleep(max(1 / dataset.fps - dt_s, 0.0))
     finally:
         robot.disconnect()
+
+
+def _dataset_action_to_robot_action(dataset: LeRobotDataset, actions, idx: int) -> dict:
+    action_array = actions[idx][ACTION]
+    return {name: action_array[i] for i, name in enumerate(dataset.features[ACTION]["names"])}
+
+
+def _move_to_start_pose(
+    robot: Robot,
+    robot_action_processor,
+    target_action: dict,
+    move_time_s: float,
+    fps: int,
+) -> None:
+    start_observation = robot.get_observation()
+    start_action = {
+        name: start_observation[name]
+        for name in target_action
+        if name in start_observation and _is_numeric(start_observation[name])
+    }
+
+    if not start_action:
+        logging.warning(
+            "Could not infer the robot start pose from observation keys. Starting replay without pre-positioning."
+        )
+        return
+
+    num_steps = max(1, math.ceil(move_time_s * fps))
+    control_interval = move_time_s / num_steps
+
+    for step in range(1, num_steps + 1):
+        start_loop_t = time.perf_counter()
+        alpha = step / num_steps
+        action = target_action.copy()
+        for name, start_value in start_action.items():
+            action[name] = float(start_value) + (float(target_action[name]) - float(start_value)) * alpha
+
+        robot_obs = robot.get_observation()
+        processed_action = robot_action_processor((action, robot_obs))
+        robot.send_action(processed_action)
+
+        dt_s = time.perf_counter() - start_loop_t
+        precise_sleep(max(control_interval - dt_s, 0.0))
+
+
+def _is_numeric(value) -> bool:
+    return isinstance(value, Real)
 
 
 def main():

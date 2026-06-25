@@ -75,6 +75,11 @@ class ACTConfig(PreTrainedConfig):
             ensembling. Defaults to None which means temporal ensembling is not used. `n_action_steps` must be
             1 when using this feature, as inference needs to happen at every step to form an ensemble. For
             more information on how ensembling works, please see `ACTTemporalEnsembler`.
+        image_crop_params: Optional per-image crop before the vision backbone. Format:
+            key -> (top, left, height, width), where key is an image feature key such as
+            "observation.images.top".
+        resize_imgs_with_padding: Optional (width, height) used to resize images after cropping while
+            preserving aspect ratio, then pad to the requested size before the vision backbone.
         dropout: Dropout to use in the transformer layers (see code for details).
         kl_weight: The weight to use for the KL-divergence component of the loss if the variational objective
             is enabled. Loss is then calculated as: `reconstruction_loss + kl_weight * kld_loss`.
@@ -117,6 +122,10 @@ class ACTConfig(PreTrainedConfig):
     # Inference.
     # Note: the value used in ACT when temporal ensembling is enabled is 0.01.
     temporal_ensemble_coeff: float | None = None
+    # Optional per-image crop before the vision backbone. Format: key -> (top, left, height, width).
+    image_crop_params: dict[str, tuple[int, int, int, int]] | None = None
+    # Optional resize-with-padding after cropping. Format: (width, height).
+    resize_imgs_with_padding: tuple[int, int] | None = None
 
     # Training and loss computation.
     dropout: float = 0.1

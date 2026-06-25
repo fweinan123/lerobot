@@ -27,6 +27,7 @@ from lerobot.scripts.lerobot_record import RecordConfig, record
 from lerobot.scripts.lerobot_replay import DatasetReplayConfig, ReplayConfig, replay
 from lerobot.scripts.lerobot_teleoperate import TeleoperateConfig, teleoperate
 from tests.fixtures.constants import DUMMY_REPO_ID
+from tests.mocks.mock_robot import MockRobot
 from tests.mocks.mock_robot import MockRobotConfig
 from tests.mocks.mock_teleop import MockTeleopConfig
 
@@ -127,3 +128,58 @@ def test_record_and_replay(tmp_path):
         mock_get_safe_version.return_value = "v3.0"
         mock_snapshot_download.return_value = str(tmp_path / "record_and_replay")
         replay(replay_cfg)
+
+
+def test_replay_moves_to_start_pose_before_episode(tmp_path):
+    robot_cfg = MockRobotConfig(random_values=False, static_values=[0.0, 0.0, 0.0])
+    teleop_cfg = MockTeleopConfig(random_values=False, static_values=[30.0, 60.0, 90.0])
+    record_dataset_cfg = DatasetRecordConfig(
+        repo_id=DUMMY_REPO_ID,
+        single_task="Dummy task",
+        root=tmp_path / "replay_move_to_start",
+        num_episodes=1,
+        episode_time_s=0.1,
+        push_to_hub=False,
+    )
+    record_cfg = RecordConfig(
+        robot=robot_cfg,
+        dataset=record_dataset_cfg,
+        teleop=teleop_cfg,
+        play_sounds=False,
+    )
+    replay_dataset_cfg = DatasetReplayConfig(
+        repo_id=DUMMY_REPO_ID,
+        episode=0,
+        root=tmp_path / "replay_move_to_start",
+        fps=30,
+    )
+    replay_cfg = ReplayConfig(
+        robot=robot_cfg,
+        dataset=replay_dataset_cfg,
+        play_sounds=False,
+        move_to_start_time_s=0.1,
+    )
+
+    record(record_cfg)
+
+    replay_robot = MockRobot(robot_cfg)
+    sent_actions = []
+
+    def send_action(action):
+        sent_actions.append(action)
+        return action
+
+    replay_robot.send_action = send_action
+
+    with (
+        patch("lerobot.datasets.dataset_metadata.get_safe_version") as mock_get_safe_version,
+        patch("lerobot.datasets.dataset_metadata.snapshot_download") as mock_snapshot_download,
+        patch("lerobot.scripts.lerobot_replay.make_robot_from_config", return_value=replay_robot),
+    ):
+        mock_get_safe_version.return_value = "v3.0"
+        mock_snapshot_download.return_value = str(tmp_path / "replay_move_to_start")
+        replay(replay_cfg)
+
+    assert sent_actions[0] == {"motor_1.pos": 10.0, "motor_2.pos": 20.0, "motor_3.pos": 30.0}
+    assert sent_actions[1] == {"motor_1.pos": 20.0, "motor_2.pos": 40.0, "motor_3.pos": 60.0}
+    assert sent_actions[2] == {"motor_1.pos": 30.0, "motor_2.pos": 60.0, "motor_3.pos": 90.0}
