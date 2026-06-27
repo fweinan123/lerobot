@@ -39,6 +39,7 @@ from PIL import Image
 
 from lerobot.cameras import ColorMode
 from lerobot.cameras.opencv import OpenCVCamera, OpenCVCameraConfig
+from lerobot.cameras.orbbec import OrbbecCamera, OrbbecCameraConfig
 from lerobot.cameras.realsense import RealSenseCamera, RealSenseCameraConfig
 
 logger = logging.getLogger(__name__)
@@ -86,12 +87,36 @@ def find_all_realsense_cameras() -> list[dict[str, Any]]:
     return all_realsense_cameras_info
 
 
-def find_and_print_cameras(camera_type_filter: str | None = None) -> list[dict[str, Any]]:
+def find_all_orbbec_cameras(preset: str | None = None) -> list[dict[str, Any]]:
+    """
+    Finds all available Orbbec SDK cameras plugged into the system.
+
+    Returns:
+        A list of all available Orbbec cameras with their metadata.
+    """
+    all_orbbec_cameras_info: list[dict[str, Any]] = []
+    logger.info("Searching for Orbbec cameras...")
+    try:
+        orbbec_cameras = OrbbecCamera.find_cameras(preset=preset)
+        for cam_info in orbbec_cameras:
+            all_orbbec_cameras_info.append(cam_info)
+        logger.info(f"Found {len(orbbec_cameras)} Orbbec cameras.")
+    except ImportError:
+        logger.warning("Skipping Orbbec camera search: pyorbbecsdk library not found or not importable.")
+    except Exception as e:
+        logger.error(f"Error finding Orbbec cameras: {e}")
+
+    return all_orbbec_cameras_info
+
+
+def find_and_print_cameras(
+    camera_type_filter: str | None = None, orbbec_preset: str | None = None
+) -> list[dict[str, Any]]:
     """
     Finds available cameras based on an optional filter and prints their information.
 
     Args:
-        camera_type_filter: Optional string to filter cameras ("realsense" or "opencv").
+        camera_type_filter: Optional string to filter cameras ("realsense", "opencv", or "orbbec").
                             If None, lists all cameras.
 
     Returns:
@@ -106,12 +131,14 @@ def find_and_print_cameras(camera_type_filter: str | None = None) -> list[dict[s
         all_cameras_info.extend(find_all_opencv_cameras())
     if camera_type_filter is None or camera_type_filter == "realsense":
         all_cameras_info.extend(find_all_realsense_cameras())
+    if camera_type_filter is None or camera_type_filter == "orbbec":
+        all_cameras_info.extend(find_all_orbbec_cameras(preset=orbbec_preset))
 
     if not all_cameras_info:
         if camera_type_filter:
             logger.warning(f"No {camera_type_filter} cameras were detected.")
         else:
-            logger.warning("No cameras (OpenCV or RealSense) were detected.")
+            logger.warning("No cameras (OpenCV, RealSense, or Orbbec) were detected.")
     else:
         print("\n--- Detected Cameras ---")
         for i, cam_info in enumerate(all_cameras_info):
@@ -151,7 +178,7 @@ def save_image(
         logger.error(f"Failed to save image for camera {camera_identifier} (type {camera_type}): {e}")
 
 
-def create_camera_instance(cam_meta: dict[str, Any]) -> dict[str, Any] | None:
+def create_camera_instance(cam_meta: dict[str, Any], orbbec_preset: str | None = None) -> dict[str, Any] | None:
     """Create and connect to a camera instance based on metadata."""
     cam_type = cam_meta.get("type")
     cam_id = cam_meta.get("id")
@@ -172,6 +199,14 @@ def create_camera_instance(cam_meta: dict[str, Any]) -> dict[str, Any] | None:
                 color_mode=ColorMode.RGB,
             )
             instance = RealSenseCamera(rs_config)
+        elif cam_type == "Orbbec":
+            ob_config = OrbbecCameraConfig(
+                serial_number_or_name=cam_id,
+                preset=orbbec_preset,
+                color_mode=ColorMode.RGB,
+                color_sensor=str(cam_meta.get("color_sensor", "color")),
+            )
+            instance = OrbbecCamera(ob_config)
         else:
             logger.warning(f"Unknown camera type: {cam_type} for ID {cam_id}. Skipping.")
             return None
@@ -195,6 +230,8 @@ def process_camera_image(
     meta = cam_dict["meta"]
     cam_type_str = str(meta.get("type", "unknown"))
     cam_id_str = str(meta.get("id", "unknown"))
+    if cam_type_str == "Orbbec" and meta.get("color_sensor"):
+        cam_id_str = f"{cam_id_str}_{meta['color_sensor']}"
 
     try:
         image_data = cam.read()
@@ -229,6 +266,7 @@ def save_images_from_all_cameras(
     output_dir: Path,
     record_time_s: float = 2.0,
     camera_type: str | None = None,
+    orbbec_preset: str | None = None,
 ):
     """
     Connects to detected cameras (optionally filtered by type) and saves images from each.
@@ -237,12 +275,12 @@ def save_images_from_all_cameras(
     Args:
         output_dir: Directory to save images.
         record_time_s: Duration in seconds to record images.
-        camera_type: Optional string to filter cameras ("realsense" or "opencv").
+        camera_type: Optional string to filter cameras ("realsense", "opencv", or "orbbec").
                             If None, uses all detected cameras.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Saving images to {output_dir}")
-    all_camera_metadata = find_and_print_cameras(camera_type_filter=camera_type)
+    all_camera_metadata = find_and_print_cameras(camera_type_filter=camera_type, orbbec_preset=orbbec_preset)
 
     if not all_camera_metadata:
         logger.warning("No cameras detected matching the criteria. Cannot save images.")
@@ -250,7 +288,7 @@ def save_images_from_all_cameras(
 
     cameras_to_use = []
     for cam_meta in all_camera_metadata:
-        camera_instance = create_camera_instance(cam_meta)
+        camera_instance = create_camera_instance(cam_meta, orbbec_preset=orbbec_preset)
         if camera_instance:
             cameras_to_use.append(camera_instance)
 
@@ -294,8 +332,8 @@ def main():
         type=str,
         nargs="?",
         default=None,
-        choices=["realsense", "opencv"],
-        help="Specify camera type to capture from (e.g., 'realsense', 'opencv'). Captures from all if omitted.",
+        choices=["realsense", "opencv", "orbbec"],
+        help="Specify camera type to capture from (e.g., 'realsense', 'opencv', 'orbbec'). Captures from all if omitted.",
     )
     parser.add_argument(
         "--output-dir",
@@ -308,6 +346,12 @@ def main():
         type=float,
         default=6.0,
         help="Time duration to attempt capturing frames. Default: 6 seconds.",
+    )
+    parser.add_argument(
+        "--orbbec-preset",
+        type=str,
+        default=None,
+        help="Optional Orbbec preset to load before enumeration, e.g. 'Dual Color Streams'.",
     )
     args = parser.parse_args()
     save_images_from_all_cameras(**vars(args))
