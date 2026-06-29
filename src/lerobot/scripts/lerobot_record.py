@@ -504,8 +504,19 @@ def record(
                     dataset.clear_episode_buffer()
                     continue
 
-                dataset.save_episode()
-                recorded_episodes += 1
+                if dataset.has_pending_frames():
+                    dataset.save_episode()
+                    recorded_episodes += 1
+                else:
+                    empty_episode_msg = (
+                        f"No frames were recorded for episode {dataset.num_episodes}; "
+                        "skipping save_episode() and keeping the episode count unchanged. "
+                        "This usually means recording was stopped immediately after pressing space, "
+                        "or Stop recording was requested during the reset phase."
+                    )
+                    logging.warning(empty_episode_msg)
+                    log_say(empty_episode_msg, cfg.play_sounds)
+                    dataset.clear_episode_buffer()
     finally:
         log_say("Stop recording", cfg.play_sounds, blocking=True)
 

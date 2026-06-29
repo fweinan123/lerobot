@@ -189,13 +189,15 @@ class _SharedOrbbecCapture:
         sdk_config.enable_stream(profile_list.get_default_video_stream_profile())
 
     def _read_loop(self) -> None:
-        if self.stop_event is None or self.pipeline is None:
+        stop_event = self.stop_event
+        pipeline = self.pipeline
+        if stop_event is None or pipeline is None:
             raise RuntimeError("Orbbec shared capture was not initialized correctly.")
 
         failure_count = 0
-        while not self.stop_event.is_set():
+        while not stop_event.is_set():
             try:
-                frame_set = self.pipeline.wait_for_frames(10000)
+                frame_set = pipeline.wait_for_frames(10000)
                 if frame_set is None:
                     raise RuntimeError("Orbbec shared capture received no frame set.")
                 if not self._has_required_frames(frame_set):
@@ -208,7 +210,7 @@ class _SharedOrbbecCapture:
                 failure_count = 0
 
             except Exception as e:
-                if self.stop_event.is_set():
+                if stop_event.is_set():
                     break
                 if failure_count <= 10:
                     failure_count += 1
@@ -487,14 +489,19 @@ class OrbbecCamera(Camera):
                 f"Failed to open {self}. Run `lerobot-find-cameras orbbec` to find available cameras."
             ) from e
 
-        if warmup and self.warmup_s > 0:
-            start_time = time.time()
-            while time.time() - start_time < self.warmup_s:
-                self.async_read(timeout_ms=self.warmup_s * 1000)
-                time.sleep(0.1)
-            with self.frame_lock:
-                if self.latest_color_frame is None or self.use_depth and self.latest_depth_frame is None:
-                    raise ConnectionError(f"{self} failed to capture frames during warmup.")
+        try:
+            if warmup and self.warmup_s > 0:
+                warmup_s = max(float(self.warmup_s), 5.0 if self.color_sensor in {"left", "right"} else 1.0)
+                start_time = time.time()
+                while time.time() - start_time < warmup_s:
+                    self.async_read(timeout_ms=warmup_s * 1000)
+                    time.sleep(0.1)
+                with self.frame_lock:
+                    if self.latest_color_frame is None or self.use_depth and self.latest_depth_frame is None:
+                        raise ConnectionError(f"{self} failed to capture frames during warmup.")
+        except Exception:
+            self.disconnect()
+            raise
 
         logger.info(f"{self} connected.")
 
