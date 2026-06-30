@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 import torch
 from termcolor import colored
 from torch.optim import Optimizer
+from torchvision.utils import save_image
 from tqdm import tqdm
 
 from lerobot.common.train_utils import (
@@ -92,6 +93,47 @@ def _validate_output_dir_distributed(cfg: TrainPipelineConfig, accelerator: "Acc
         if result[0]["error_type"] == "FileExistsError":
             raise FileExistsError(error_message)
         raise RuntimeError(error_message)
+
+
+def _save_model_input_images(
+    policy: PreTrainedPolicy,
+    accelerator: "Accelerator",
+    output_dir: Path | None,
+    step: int,
+) -> None:
+    """Save a small grid of the latest images that were actually fed to the policy."""
+    if output_dir is None:
+        logging.warning("Skipping model input image save at step %s because output_dir is not set.", step)
+        return
+
+    unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+    images = getattr(unwrapped_policy, "_last_prepared_images", None)
+    if not images:
+        logging.warning(
+            "Skipping model input image save at step %s because policy has no prepared image cache.",
+            step,
+        )
+        return
+
+    image_features = list(getattr(getattr(unwrapped_policy, "config", None), "image_features", []))
+    save_dir = output_dir / "model_input_images" / f"step_{step:06d}"
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_paths = []
+    for idx, img in enumerate(images):
+        if img.ndim != 4:
+            logging.warning("Skipping cached model input image %s at step %s with shape %s.", idx, step, img.shape)
+            continue
+
+        image_key = image_features[idx] if idx < len(image_features) else f"camera_{idx}"
+        safe_key = image_key.replace("/", "_").replace(".", "_").replace(" ", "_")
+        image_path = save_dir / f"{safe_key}.png"
+        img_to_save = img.detach().to(device="cpu", dtype=torch.float32).clamp(0.0, 1.0)
+        save_image(img_to_save, image_path, nrow=min(4, img_to_save.shape[0]))
+        saved_paths.append(image_path)
+
+    if saved_paths:
+        logging.info("Saved model input images at step %s to %s", step, save_dir)
 
 
 def update_policy(
@@ -516,7 +558,15 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         train_tracker.step()
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
+        is_model_input_image_save_step = (
+            cfg.save_model_input_images_freq > 0
+            and step % cfg.save_model_input_images_freq == 0
+            and is_main_process
+        )
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
+
+        if is_model_input_image_save_step:
+            _save_model_input_images(policy, accelerator, cfg.output_dir, step)
 
         if is_log_step:
             logging.info(train_tracker)

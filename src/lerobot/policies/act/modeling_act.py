@@ -73,6 +73,28 @@ def crop_image(img: Tensor, key: str, crop_params: tuple[int, int, int, int]) ->
     return img[:, :, top : top + height, left : left + width]
 
 
+def apply_brightness_contrast_jitter(
+    img: Tensor,
+    jitter: dict[str, tuple[float, float]],
+) -> Tensor:
+    if img.ndim != 4:
+        raise ValueError(f"(b,c,h,w) expected, but {img.shape}")
+
+    batch_size = img.shape[0]
+    if "brightness" in jitter:
+        low, high = jitter["brightness"]
+        factors = torch.empty(batch_size, 1, 1, 1, device=img.device, dtype=img.dtype).uniform_(low, high)
+        img = img * factors
+
+    if "contrast" in jitter:
+        low, high = jitter["contrast"]
+        factors = torch.empty(batch_size, 1, 1, 1, device=img.device, dtype=img.dtype).uniform_(low, high)
+        mean = img.mean(dim=(2, 3), keepdim=True)
+        img = (img - mean) * factors + mean
+
+    return img.clamp_(0.0, 1.0)
+
+
 class ACTPolicy(PreTrainedPolicy):
     """
     Action Chunking Transformer Policy as per Learning Fine-Grained Bimanual Manipulation with Low-Cost
@@ -97,6 +119,7 @@ class ACTPolicy(PreTrainedPolicy):
         self.config = config
 
         self.model = ACT(config)
+        self._last_prepared_images: list[Tensor] | None = None
 
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
@@ -140,8 +163,12 @@ class ACTPolicy(PreTrainedPolicy):
                 img = crop_image(img, key, self.config.image_crop_params[key])
             if self.config.resize_imgs_with_padding is not None:
                 img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0.0)
+            if self.training and self.config.image_brightness_contrast_jitter is not None:
+                img = apply_brightness_contrast_jitter(img, self.config.image_brightness_contrast_jitter)
             images.append(img)
             image_shapes.add(tuple(img.shape[-2:]))
+
+        self._last_prepared_images = [img[: min(8, img.shape[0])].detach() for img in images]
 
         if len(image_shapes) > 1:
             raise ValueError(

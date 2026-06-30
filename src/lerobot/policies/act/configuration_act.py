@@ -126,6 +126,9 @@ class ACTConfig(PreTrainedConfig):
     image_crop_params: dict[str, tuple[int, int, int, int]] | None = None
     # Optional resize-with-padding after cropping. Format: (width, height).
     resize_imgs_with_padding: tuple[int, int] | None = None
+    # Optional training-only brightness/contrast jitter applied after crop/resize.
+    # Values are sampled uniformly from the configured ranges.
+    image_brightness_contrast_jitter: dict[str, tuple[float, float]] | None = None
 
     # Training and loss computation.
     dropout: float = 0.1
