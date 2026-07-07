@@ -142,6 +142,8 @@ def init_keyboard_listener():
     events["rerecord_episode"] = False
     events["stop_recording"] = False
     events["start_recording_episode"] = False
+    events["teleop_enabled"] = False
+    events["teleop_release_requested"] = False
 
     if is_headless():
         logging.warning(
@@ -157,12 +159,18 @@ def init_keyboard_listener():
         try:
             if key == keyboard.Key.right:
                 print("Right arrow key pressed. Exiting loop...")
+                events["teleop_enabled"] = False
                 events["exit_early"] = True
             elif key == keyboard.Key.space:
                 print("Space key pressed. Starting episode recording...")
                 events["start_recording_episode"] = True
+            elif key in (keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
+                print("Ctrl key pressed. Enabling teleoperation...")
+                events["teleop_enabled"] = True
+                events["teleop_release_requested"] = True
             elif key == keyboard.Key.left:
                 print("Left arrow key pressed. Exiting loop and rerecord the last episode...")
+                events["teleop_enabled"] = False
                 events["rerecord_episode"] = True
                 events["exit_early"] = True
             elif key == keyboard.Key.esc:

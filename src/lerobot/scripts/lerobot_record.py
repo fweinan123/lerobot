@@ -87,6 +87,7 @@ lerobot-record \\
 """
 
 import logging
+import threading
 import time
 from dataclasses import asdict, dataclass
 from pprint import pformat
@@ -213,6 +214,226 @@ class RecordConfig:
 """
 
 
+def make_hold_action(robot: Robot, obs: RobotObservation) -> RobotAction:
+    """Hold the robot at its current action-space positions."""
+    hold_action = {}
+    for key in robot.action_features:
+        if key in obs:
+            hold_action[key] = obs[key]
+        elif key.endswith(".pos") and key.removesuffix(".pos") in obs:
+            hold_action[key] = obs[key.removesuffix(".pos")]
+
+    missing_keys = sorted(set(robot.action_features) - set(hold_action))
+    if missing_keys:
+        raise KeyError(f"Cannot build hold action; observation is missing action keys: {missing_keys}")
+
+    return hold_action
+
+
+def clear_hold_targets(events: dict) -> None:
+    events.pop("robot_hold_action", None)
+
+
+def get_robot_motor_observation(robot: Robot) -> RobotObservation:
+    """Read robot joint positions without reading cameras when the robot exposes a motor bus."""
+    if hasattr(robot, "bus") and hasattr(robot.bus, "sync_read_all_states"):
+        states = robot.bus.sync_read_all_states()
+        return {
+            f"{motor}.pos": state.get("position", 0.0)
+            for motor, state in states.items()
+            if state.get("position") is not None
+        }
+
+    return robot.get_observation()
+
+
+def send_robot_hold_action(
+    robot: Robot,
+    robot_action_processor: RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction],
+    events: dict | None = None,
+) -> None:
+    if events is not None and "robot_hold_action" in events:
+        hold_action = events["robot_hold_action"]
+        obs = hold_action
+    else:
+        obs = get_robot_motor_observation(robot)
+        hold_action = make_hold_action(robot, obs)
+        if events is not None:
+            events["robot_hold_action"] = hold_action
+    robot_hold_action = robot_action_processor((hold_action, obs))
+    robot.send_action(robot_hold_action)
+
+
+def hold_teleoperator_if_supported(teleop: Teleoperator | list[Teleoperator] | None) -> None:
+    """Hold teleoperator hardware in place when it exposes a hold_position hook."""
+    teleops = teleop if isinstance(teleop, list) else [teleop]
+    for item in teleops:
+        if item is not None and hasattr(item, "hold_position"):
+            item.hold_position()
+
+
+def release_teleoperator_if_supported(teleop: Teleoperator | list[Teleoperator] | None) -> None:
+    """Release teleoperator hardware for manual control when it exposes a release hook."""
+    teleops = teleop if isinstance(teleop, list) else [teleop]
+    for item in teleops:
+        if item is not None and hasattr(item, "release_for_manual_control"):
+            item.release_for_manual_control()
+
+
+def safe_cleanup(name: str, cleanup_fn) -> None:
+    """Run cleanup without preventing later resources from being released."""
+    try:
+        cleanup_fn()
+    except Exception:
+        logging.exception("Error while cleaning up %s.", name)
+
+
+class HoldPositionGuard:
+    """Continuously hold robot and teleoperator positions while blocking work runs."""
+
+    def __init__(
+        self,
+        robot: Robot,
+        teleop: Teleoperator | list[Teleoperator] | None,
+        robot_action_processor: RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction],
+        fps: int,
+        events: dict | None = None,
+    ):
+        self.robot = robot
+        self.teleop = teleop
+        self.robot_action_processor = robot_action_processor
+        self.period_s = 1 / fps
+        self.events = events if events is not None else {}
+        self.stop_event = threading.Event()
+        self.robot_thread: threading.Thread | None = None
+        self.teleop_thread: threading.Thread | None = None
+
+    def __enter__(self):
+        self.robot_thread = threading.Thread(target=self._run_robot_hold, name="record_robot_hold", daemon=True)
+        self.teleop_thread = threading.Thread(
+            target=self._run_teleop_hold, name="record_teleop_hold", daemon=True
+        )
+        self.robot_thread.start()
+        self.teleop_thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.stop_event.set()
+        if self.robot_thread is not None:
+            self.robot_thread.join(timeout=2.0)
+        if self.teleop_thread is not None:
+            self.teleop_thread.join(timeout=2.0)
+
+    def _run_robot_hold(self) -> None:
+        while not self.stop_event.is_set():
+            start_t = time.perf_counter()
+            try:
+                send_robot_hold_action(self.robot, self.robot_action_processor, self.events)
+            except Exception:
+                logging.exception("Failed to refresh robot hold position while saving episode.")
+                self.stop_event.set()
+                break
+
+            self.stop_event.wait(max(self.period_s - (time.perf_counter() - start_t), 0.0))
+
+    def _run_teleop_hold(self) -> None:
+        while not self.stop_event.is_set():
+            start_t = time.perf_counter()
+            try:
+                hold_teleoperator_if_supported(self.teleop)
+            except Exception:
+                logging.exception("Failed to refresh teleoperator hold position while saving episode.")
+                self.stop_event.set()
+                break
+
+            self.stop_event.wait(max(self.period_s - (time.perf_counter() - start_t), 0.0))
+
+
+def idle_control_loop(
+    robot: Robot,
+    events: dict,
+    fps: int,
+    teleop_action_processor: RobotProcessorPipeline[
+        tuple[RobotAction, RobotObservation], RobotAction
+    ],
+    robot_action_processor: RobotProcessorPipeline[
+        tuple[RobotAction, RobotObservation], RobotAction
+    ],
+    teleop: Teleoperator | list[Teleoperator] | None,
+    control_time_s: float | None = None,
+    exit_on_start_recording: bool = False,
+) -> None:
+    """Control or hold the robot without reading cameras or writing dataset frames."""
+    teleop_arm = teleop_keyboard = None
+    if isinstance(teleop, list):
+        teleop_keyboard = next((t for t in teleop if isinstance(t, KeyboardTeleop)), None)
+        teleop_arm = next(
+            (
+                t
+                for t in teleop
+                if isinstance(
+                    t,
+                    (
+                        so_leader.SO100Leader
+                        | so_leader.SO101Leader
+                        | koch_leader.KochLeader
+                        | omx_leader.OmxLeader
+                    ),
+                )
+            ),
+            None,
+        )
+
+    control_interval = 1 / fps
+    timestamp = 0.0
+    start_t = time.perf_counter()
+    while control_time_s is None or timestamp < control_time_s:
+        start_loop_t = time.perf_counter()
+
+        if exit_on_start_recording and events["start_recording_episode"]:
+            break
+        if events["stop_recording"]:
+            break
+        if events["exit_early"]:
+            events["exit_early"] = False
+            hold_teleoperator_if_supported(teleop)
+            send_robot_hold_action(robot, robot_action_processor, events)
+            break
+
+        if events.pop("teleop_release_requested", False):
+            clear_hold_targets(events)
+            release_teleoperator_if_supported(teleop)
+
+        obs = get_robot_motor_observation(robot)
+        if not events.get("teleop_enabled", True):
+            if "robot_hold_action" not in events:
+                events["robot_hold_action"] = make_hold_action(robot, obs)
+            action_values = events["robot_hold_action"]
+            robot_action_to_send = robot_action_processor((action_values, obs))
+        elif isinstance(teleop, Teleoperator):
+            act = teleop.get_action()
+            act_processed_teleop = teleop_action_processor((act, obs))
+            robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
+        elif isinstance(teleop, list) and teleop_arm is not None and teleop_keyboard is not None:
+            arm_action = teleop_arm.get_action()
+            arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
+            keyboard_action = teleop_keyboard.get_action()
+            base_action = robot._from_keyboard_to_base_action(keyboard_action)
+            act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
+            act_processed_teleop = teleop_action_processor((act, obs))
+            robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
+        else:
+            precise_sleep(control_interval)
+            timestamp = time.perf_counter() - start_t
+            continue
+
+        robot.send_action(robot_action_to_send)
+        if not events.get("teleop_enabled", True):
+            hold_teleoperator_if_supported(teleop)
+        precise_sleep(max(control_interval - (time.perf_counter() - start_loop_t), 0.0))
+        timestamp = time.perf_counter() - start_t
+
+
 @safe_stop_image_writer
 def record_loop(
     robot: Robot,
@@ -229,10 +450,11 @@ def record_loop(
     ],  # runs after robot
     dataset: LeRobotDataset | None = None,
     teleop: Teleoperator | list[Teleoperator] | None = None,
-    control_time_s: int | None = None,
+    control_time_s: float | None = None,
     single_task: str | None = None,
     display_data: bool = False,
     display_compressed_images: bool = False,
+    exit_on_start_recording: bool = False,
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -267,12 +489,21 @@ def record_loop(
     no_action_count = 0
     timestamp = 0
     start_episode_t = time.perf_counter()
-    while timestamp < control_time_s:
+    while control_time_s is None or timestamp < control_time_s:
         start_loop_t = time.perf_counter()
+
+        if exit_on_start_recording and events["start_recording_episode"]:
+            break
 
         if events["exit_early"]:
             events["exit_early"] = False
+            hold_teleoperator_if_supported(teleop)
+            send_robot_hold_action(robot, robot_action_processor, events)
             break
+
+        if events.pop("teleop_release_requested", False):
+            clear_hold_targets(events)
+            release_teleoperator_if_supported(teleop)
 
         # Get robot observation
         obs = robot.get_observation()
@@ -283,8 +514,13 @@ def record_loop(
         if dataset is not None:
             observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
 
+        if not events.get("teleop_enabled", True):
+            if "robot_hold_action" not in events:
+                events["robot_hold_action"] = make_hold_action(robot, obs_processed)
+            action_values = events["robot_hold_action"]
+            robot_action_to_send = robot_action_processor((action_values, obs))
         # Get action from teleop
-        if isinstance(teleop, Teleoperator):
+        elif isinstance(teleop, Teleoperator):
             act = teleop.get_action()
             if robot.name == "unitree_g1":
                 teleop.send_feedback(obs)
@@ -318,6 +554,8 @@ def record_loop(
         # so action actually sent is saved in the dataset. action = postprocessor.process(action)
         # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
         _sent_action = robot.send_action(robot_action_to_send)
+        if not events.get("teleop_enabled", True):
+            hold_teleoperator_if_supported(teleop)
 
         # Write to dataset
         if dataset is not None:
@@ -343,12 +581,35 @@ def record_loop(
         timestamp = time.perf_counter() - start_episode_t
 
 
-def wait_for_episode_start(events: dict, play_sounds: bool) -> None:
-    """Block before recording an episode until the user presses space."""
+def wait_for_episode_start(
+    robot: Robot,
+    events: dict,
+    fps: int,
+    teleop_action_processor: RobotProcessorPipeline[
+        tuple[RobotAction, RobotObservation], RobotAction
+    ],
+    robot_action_processor: RobotProcessorPipeline[
+        tuple[RobotAction, RobotObservation], RobotAction
+    ],
+    teleop: Teleoperator | list[Teleoperator] | None,
+    play_sounds: bool,
+) -> None:
+    """Teleoperate without recording until the user presses space."""
     events["start_recording_episode"] = False
     log_say("Press space to start recording episode", play_sounds)
     while not events["start_recording_episode"] and not events["stop_recording"]:
-        precise_sleep(0.05)
+        idle_control_loop(
+            robot=robot,
+            events=events,
+            fps=fps,
+            teleop_action_processor=teleop_action_processor,
+            robot_action_processor=robot_action_processor,
+            teleop=teleop,
+            control_time_s=None,
+            exit_on_start_recording=True,
+        )
+        if events["rerecord_episode"] and not events["start_recording_episode"]:
+            events["rerecord_episode"] = False
     events["start_recording_episode"] = False
 
 
@@ -457,7 +718,15 @@ def record(
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
-                wait_for_episode_start(events, cfg.play_sounds)
+                wait_for_episode_start(
+                    robot=robot,
+                    events=events,
+                    fps=cfg.dataset.fps,
+                    teleop_action_processor=teleop_action_processor,
+                    robot_action_processor=robot_action_processor,
+                    teleop=teleop,
+                    play_sounds=cfg.play_sounds,
+                )
                 if events["stop_recording"]:
                     break
 
@@ -484,28 +753,27 @@ def record(
                 ):
                     log_say("Reset the environment", cfg.play_sounds)
 
-                    record_loop(
+                    idle_control_loop(
                         robot=robot,
                         events=events,
                         fps=cfg.dataset.fps,
                         teleop_action_processor=teleop_action_processor,
                         robot_action_processor=robot_action_processor,
-                        robot_observation_processor=robot_observation_processor,
                         teleop=teleop,
                         control_time_s=cfg.dataset.reset_time_s,
-                        single_task=cfg.dataset.single_task,
-                        display_data=cfg.display_data,
                     )
 
                 if events["rerecord_episode"]:
                     log_say("Re-record episode", cfg.play_sounds)
                     events["rerecord_episode"] = False
                     events["exit_early"] = False
-                    dataset.clear_episode_buffer()
+                    with HoldPositionGuard(robot, teleop, robot_action_processor, cfg.dataset.fps, events):
+                        dataset.clear_episode_buffer()
                     continue
 
                 if dataset.has_pending_frames():
-                    dataset.save_episode()
+                    with HoldPositionGuard(robot, teleop, robot_action_processor, cfg.dataset.fps, events):
+                        dataset.save_episode()
                     recorded_episodes += 1
                 else:
                     empty_episode_msg = (
@@ -516,28 +784,32 @@ def record(
                     )
                     logging.warning(empty_episode_msg)
                     log_say(empty_episode_msg, cfg.play_sounds)
-                    dataset.clear_episode_buffer()
+                    with HoldPositionGuard(robot, teleop, robot_action_processor, cfg.dataset.fps, events):
+                        dataset.clear_episode_buffer()
     finally:
-        log_say("Stop recording", cfg.play_sounds, blocking=True)
+        safe_cleanup("stop recording sound", lambda: log_say("Stop recording", cfg.play_sounds, blocking=True))
 
         if dataset:
-            dataset.finalize()
+            safe_cleanup("dataset", dataset.finalize)
 
         if robot.is_connected:
-            robot.disconnect()
+            safe_cleanup("robot", robot.disconnect)
         if teleop and teleop.is_connected:
-            teleop.disconnect()
+            safe_cleanup("teleoperator", teleop.disconnect)
 
         if not is_headless() and listener:
-            listener.stop()
+            safe_cleanup("keyboard listener", listener.stop)
 
         if cfg.dataset.push_to_hub:
             if dataset and dataset.num_episodes > 0:
-                dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
+                safe_cleanup(
+                    "dataset push_to_hub",
+                    lambda: dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private),
+                )
             else:
                 logging.warning("No episodes saved — skipping push to hub")
 
-        log_say("Exiting", cfg.play_sounds)
+        safe_cleanup("exit sound", lambda: log_say("Exiting", cfg.play_sounds))
     return dataset
 
 

@@ -217,8 +217,11 @@ def create_camera_instance(cam_meta: dict[str, Any], orbbec_preset: str | None =
             return {"instance": instance, "meta": cam_meta}
     except Exception as e:
         logger.error(f"Failed to connect or configure {cam_type} camera {cam_id}: {e}")
-        if instance and instance.is_connected:
-            instance.disconnect()
+        if instance:
+            try:
+                instance.disconnect()
+            except Exception:
+                logger.debug("Camera cleanup after failed connect also failed.", exc_info=True)
         return None
 
 

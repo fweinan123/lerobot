@@ -277,7 +277,10 @@ class _SharedOrbbecCapture:
         self.stop_event = None
 
         if self.pipeline is not None:
-            self.pipeline.stop()
+            try:
+                self.pipeline.stop()
+            except Exception as e:
+                logger.warning("Error stopping Orbbec shared capture pipeline for %s: %s", self.key, e)
             self.pipeline = None
 
         with self.frame_lock:
@@ -474,34 +477,41 @@ class OrbbecCamera(Camera):
 
     @check_if_already_connected
     def connect(self, warmup: bool = True) -> None:
-        self.device = self._find_device()
-        if self.preset is not None:
-            self._load_device_preset(self.device, self.preset)
+        max_attempts = 2 if self.color_sensor in {"left", "right"} else 1
+        for attempt in range(1, max_attempts + 1):
+            self.device = self._find_device()
+            if self.preset is not None:
+                self._load_device_preset(self.device, self.preset)
 
-        self._configure_capture_settings()
-        self.shared_capture = self._get_shared_capture()
-        try:
-            self.shared_capture.acquire()
-        except Exception as e:
-            self.shared_capture = None
-            self.device = None
-            raise ConnectionError(
-                f"Failed to open {self}. Run `lerobot-find-cameras orbbec` to find available cameras."
-            ) from e
+            self._configure_capture_settings()
+            self.shared_capture = self._get_shared_capture()
+            try:
+                self.shared_capture.acquire()
+            except Exception as e:
+                self.shared_capture = None
+                self.device = None
+                raise ConnectionError(
+                    f"Failed to open {self}. Run `lerobot-find-cameras orbbec` to find available cameras."
+                ) from e
 
-        try:
-            if warmup and self.warmup_s > 0:
-                warmup_s = max(float(self.warmup_s), 5.0 if self.color_sensor in {"left", "right"} else 1.0)
-                start_time = time.time()
-                while time.time() - start_time < warmup_s:
-                    self.async_read(timeout_ms=warmup_s * 1000)
-                    time.sleep(0.1)
-                with self.frame_lock:
-                    if self.latest_color_frame is None or self.use_depth and self.latest_depth_frame is None:
-                        raise ConnectionError(f"{self} failed to capture frames during warmup.")
-        except Exception:
-            self.disconnect()
-            raise
+            try:
+                if warmup and self.warmup_s > 0:
+                    warmup_s = max(float(self.warmup_s), 5.0 if self.color_sensor in {"left", "right"} else 1.0)
+                    start_time = time.time()
+                    while time.time() - start_time < warmup_s:
+                        self.async_read(timeout_ms=warmup_s * 1000)
+                        time.sleep(0.1)
+                    with self.frame_lock:
+                        if self.latest_color_frame is None or self.use_depth and self.latest_depth_frame is None:
+                            raise ConnectionError(f"{self} failed to capture frames during warmup.")
+                break
+            except Exception as e:
+                self._release_shared_capture(force_remove=True)
+                self.device = None
+                if attempt >= max_attempts:
+                    raise
+                logger.warning("Retrying Orbbec connection for %s after warmup failure: %s", self, e)
+                time.sleep(1.0)
 
         logger.info(f"{self} connected.")
 
@@ -582,6 +592,22 @@ class OrbbecCamera(Camera):
                 _SHARED_CAPTURES[key] = capture
 
         return capture
+
+    def _release_shared_capture(self, *, force_remove: bool = False) -> None:
+        if self.shared_capture is None:
+            return
+
+        key = self.shared_capture.key
+        with _SHARED_CAPTURE_LOCK:
+            release_failed = False
+            try:
+                self.shared_capture.release()
+            except Exception as e:
+                release_failed = True
+                logger.warning("Error releasing Orbbec shared capture %s: %s", key, e)
+            if force_remove or release_failed or self.shared_capture.ref_count <= 0:
+                _SHARED_CAPTURES.pop(key, None)
+        self.shared_capture = None
 
     def _configure_capture_settings(self) -> None:
         if self.device is None:
@@ -851,13 +877,12 @@ class OrbbecCamera(Camera):
                 f"Attempted to disconnect {self}, but it appears already disconnected."
             )
 
-        if self.shared_capture is not None:
-            key = self.shared_capture.key
-            with _SHARED_CAPTURE_LOCK:
-                self.shared_capture.release()
-                if self.shared_capture.ref_count <= 0:
-                    _SHARED_CAPTURES.pop(key, None)
-            self.shared_capture = None
+        try:
+            self._stop_read_thread()
+        except Exception as e:
+            logger.warning("Error stopping Orbbec camera read thread for %s: %s", self, e)
+
+        self._release_shared_capture()
 
         self.pipeline = None
         self.device = None

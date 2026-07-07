@@ -71,6 +71,9 @@ class OpenArmLeader(Teleoperator):
         self._pin_q = None
         self._pin_joint_q_indices: dict[str, int] = {}
         self._pin_joint_v_indices: dict[str, int] = {}
+        self._hold_torque_enabled = False
+        self._manual_gravity_compensation_paused = False
+        self._hold_positions: dict[str, float] | None = None
 
     @property
     def action_features(self) -> dict[str, type]:
@@ -114,6 +117,8 @@ class OpenArmLeader(Teleoperator):
             self.calibrate()
 
         self.configure()
+        if not self.config.manual_control and self.config.gravity_compensation:
+            self._load_pinocchio_model()
 
         logger.info(f"{self} connected.")
 
@@ -183,6 +188,68 @@ class OpenArmLeader(Teleoperator):
 
         return self.bus.disable_torque() if self.config.manual_control else self.bus.configure_motors()
 
+    def hold_position(self) -> RobotAction:
+        """Hold the leader arm at its current joint positions."""
+        if self._hold_positions is None:
+            states = self.bus.sync_read_all_states()
+            self._hold_positions = {
+                motor: state.get("position")
+                for motor, state in states.items()
+                if state.get("position") is not None
+            }
+        positions = self._hold_positions
+        if not positions:
+            raise RuntimeError("Cannot hold OpenArm leader; no motor positions were read.")
+
+        if not self._hold_torque_enabled:
+            self.bus.enable_torque()
+            self._hold_torque_enabled = True
+        self._manual_gravity_compensation_paused = False
+
+        self._send_hold_position(positions)
+        return {f"{motor}.pos": position for motor, position in positions.items()}
+
+    def _send_hold_position(self, positions: dict[str, float]) -> None:
+        motor_index = {
+            "joint_1": 0,
+            "joint_2": 1,
+            "joint_3": 2,
+            "joint_4": 3,
+            "joint_5": 4,
+            "joint_6": 5,
+            "joint_7": 6,
+            "gripper": 7,
+        }
+        commands = {}
+        for motor_name, position_degrees in positions.items():
+            idx = motor_index.get(motor_name, 0)
+            kp = (
+                self.config.position_kp[idx]
+                if isinstance(self.config.position_kp, list)
+                else self.config.position_kp
+            )
+            kd = (
+                self.config.position_kd[idx]
+                if isinstance(self.config.position_kd, list)
+                else self.config.position_kd
+            )
+            commands[motor_name] = (kp, kd, position_degrees, 0.0, 0.0)
+
+        self.bus._mit_control_batch(commands)
+
+    def release_for_manual_control(self) -> None:
+        """Release the leader arm so it can be moved by hand."""
+        if self.config.manual_control:
+            self.bus.disable_torque()
+            self._manual_gravity_compensation_paused = True
+        elif self.config.gravity_compensation:
+            self._manual_gravity_compensation_paused = False
+        else:
+            self.bus.disable_torque()
+            self._manual_gravity_compensation_paused = True
+        self._hold_torque_enabled = False
+        self._hold_positions = None
+
     def _normalized_side(self) -> str:
         side = self.config.side or "right"
         side = side.removesuffix("_arm")
@@ -236,7 +303,11 @@ class OpenArmLeader(Teleoperator):
         logger.info("Loaded OpenArm leader Pinocchio model from %s for %s arm.", urdf_path, side)
 
     def _apply_gravity_compensation(self, states: dict[str, Any]) -> None:
-        if self.config.manual_control or not self.config.gravity_compensation:
+        if (
+            self.config.manual_control
+            or not self.config.gravity_compensation
+            or self._manual_gravity_compensation_paused
+        ):
             return
 
         self._load_pinocchio_model()
@@ -279,6 +350,7 @@ class OpenArmLeader(Teleoperator):
         Reads all motor states (pos/vel/torque) in one CAN refresh cycle.
         """
         start = time.perf_counter()
+        self.release_for_manual_control()
 
         action_dict: dict[str, Any] = {}
 
