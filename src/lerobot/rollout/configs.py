@@ -209,6 +209,18 @@ class RolloutConfig:
     # Rename map for mapping robot/dataset observation keys to policy keys
     rename_map: dict[str, str] = field(default_factory=dict)
 
+    # Hardware startup
+    # Before policy control starts, move joint_2 away from the direct path.
+    # Set move_to_initial_position_time_s > 0 to also interpolate back to the
+    # robot pose captured at startup.
+    move_to_initial_position_on_start: bool = True
+    move_to_initial_position_time_s: float = 0.0
+    start_j2_preopen_deg: float = 70.0
+    start_j2_preopen_time_s: float = 1.0
+    start_j4_preopen_deg: float = 80.0
+    start_j4_preopen_time_s: float = 1.0
+    first_policy_action_transition_time_s: float = 1.0
+
     # Hardware teardown
     # When True (default), smoothly interpolate the robot back to the joint
     # positions captured at startup before disconnecting.  Set to False to

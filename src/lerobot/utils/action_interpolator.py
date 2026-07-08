@@ -58,6 +58,7 @@ class ActionInterpolator:
         self._prev: Tensor | None = None
         self._buffer: list[Tensor] = []
         self._idx = 0
+        self._next_transition_steps: int | None = None
 
     @property
     def enabled(self) -> bool:
@@ -69,6 +70,14 @@ class ActionInterpolator:
         self._prev = None
         self._buffer = []
         self._idx = 0
+        self._next_transition_steps = None
+
+    def set_previous(self, action: Tensor, transition_steps: int | None = None) -> None:
+        """Prime interpolation with the robot's current action-like state."""
+        self._prev = action.clone()
+        self._buffer = []
+        self._idx = 0
+        self._next_transition_steps = transition_steps
 
     def needs_new_action(self) -> bool:
         """Check if a new action is needed from the queue."""
@@ -80,10 +89,14 @@ class ActionInterpolator:
         Args:
             action: New action tensor from policy/queue (already on CPU).
         """
-        if self.multiplier > 1 and self._prev is not None:
+        transition_steps = self._next_transition_steps
+        self._next_transition_steps = None
+        num_steps = transition_steps if transition_steps is not None else self.multiplier
+
+        if num_steps > 1 and self._prev is not None:
             self._buffer = []
-            for i in range(1, self.multiplier + 1):
-                t = i / self.multiplier
+            for i in range(1, num_steps + 1):
+                t = i / num_steps
                 interp = self._prev + t * (action - self._prev)
                 self._buffer.append(interp)
         else:

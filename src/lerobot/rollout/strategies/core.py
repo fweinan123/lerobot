@@ -21,6 +21,8 @@ import logging
 import time
 from typing import TYPE_CHECKING
 
+import torch
+
 from lerobot.datasets.utils import DEFAULT_VIDEO_FILE_SIZE_IN_MB
 from lerobot.utils.action_interpolator import ActionInterpolator
 from lerobot.utils.constants import OBS_STR
@@ -51,6 +53,8 @@ class RolloutStrategy(abc.ABC):
         self._interpolator: ActionInterpolator | None = None
         self._warmup_flushed: bool = False
         self._cached_obs_processed: dict | None = None
+        self._did_startup_move: bool = False
+        self._rollout_ctx = None
 
     def _init_engine(self, ctx: RolloutContext) -> None:
         """Attach the inference engine and action interpolator, then start the backend.
@@ -60,7 +64,10 @@ class RolloutStrategy(abc.ABC):
         Call this from ``setup()`` so strategies share identical
         initialisation without duplicating code.
         """
+        self._rollout_ctx = ctx
+        self._move_to_initial_position_before_start(ctx)
         self._interpolator = ActionInterpolator(multiplier=ctx.runtime.cfg.interpolation_multiplier)
+        self._prime_action_interpolator_from_robot()
         self._engine = ctx.policy.inference
         logger.info("Starting inference engine...")
         self._engine.reset()
@@ -112,9 +119,71 @@ class RolloutStrategy(abc.ABC):
             logger.info("Warmup complete — flushing stale state and resuming engine")
             engine.reset()
             interpolator.reset()
+            self._prime_action_interpolator_from_robot()
             self._warmup_flushed = True
             engine.resume()
         return False
+
+    def _prime_action_interpolator_from_robot(self) -> None:
+        """Use the current robot pose as the previous action for first-step smoothing."""
+        if self._interpolator is None:
+            return
+        if not hasattr(self, "_rollout_ctx"):
+            return
+
+        ctx = self._rollout_ctx
+        ordered_keys = ctx.data.ordered_action_keys
+        if not ordered_keys:
+            return
+
+        try:
+            obs = ctx.hardware.robot_wrapper.get_observation()
+            previous_action = []
+            for key in ordered_keys:
+                if key not in obs:
+                    logger.debug("Cannot prime action interpolator: %s not found in robot observation", key)
+                    return
+                previous_action.append(float(obs[key]))
+            transition_time_s = max(float(ctx.runtime.cfg.first_policy_action_transition_time_s), 0.0)
+            transition_steps = max(int(transition_time_s * ctx.runtime.cfg.fps), 1) if transition_time_s > 0 else None
+            self._interpolator.set_previous(torch.tensor(previous_action), transition_steps)
+            logger.info(
+                "Primed action interpolator from current robot pose (first-action transition steps=%s)",
+                transition_steps or "default",
+            )
+        except Exception as e:
+            logger.warning("Could not prime action interpolator from robot pose: %s", e)
+
+    def _move_to_initial_position_before_start(self, ctx: RolloutContext) -> None:
+        """Move through a safer joint_2 pose before policy control starts."""
+        cfg = ctx.runtime.cfg
+        hw = ctx.hardware
+        if self._did_startup_move:
+            return
+        self._did_startup_move = True
+
+        if not cfg.move_to_initial_position_on_start:
+            return
+        if not hw.initial_position:
+            logger.warning("No initial robot position captured; skipping startup move-to-initial.")
+            return
+
+        logger.info(
+            "Preparing rollout start pose: preopen joint_2 by %.1f deg, joint_4 by %.1f deg, interpolate time %.1fs",
+            cfg.start_j2_preopen_deg,
+            cfg.start_j4_preopen_deg,
+            cfg.move_to_initial_position_time_s,
+        )
+        self._move_via_startup_preopen(
+            hw=hw,
+            target=hw.initial_position,
+            move_time_s=cfg.move_to_initial_position_time_s,
+            j2_preopen_deg=cfg.start_j2_preopen_deg,
+            j2_preopen_time_s=cfg.start_j2_preopen_time_s,
+            j4_preopen_deg=cfg.start_j4_preopen_deg,
+            j4_preopen_time_s=cfg.start_j4_preopen_time_s,
+            fps=max(int(cfg.fps), 1),
+        )
 
     def _teardown_hardware(self, hw: HardwareContext, return_to_initial_position: bool = True) -> None:
         """Stop the inference engine, optionally return robot to initial position, and disconnect hardware."""
@@ -140,21 +209,118 @@ class RolloutStrategy(abc.ABC):
     @staticmethod
     def _return_to_initial_position(hw: HardwareContext, duration_s: float = 3.0, fps: int = 50) -> None:
         """Smoothly interpolate the robot back to its initial position."""
+        RolloutStrategy._move_via_startup_preopen(
+            hw=hw,
+            target=hw.initial_position,
+            move_time_s=duration_s,
+            j2_preopen_deg=0.0,
+            j2_preopen_time_s=0.0,
+            j4_preopen_deg=0.0,
+            j4_preopen_time_s=0.0,
+            fps=fps,
+        )
+
+    @staticmethod
+    def _move_via_startup_preopen(
+        hw: HardwareContext,
+        target: dict,
+        move_time_s: float,
+        j2_preopen_deg: float,
+        j2_preopen_time_s: float,
+        j4_preopen_deg: float,
+        j4_preopen_time_s: float,
+        fps: int,
+    ) -> None:
+        """Optionally move startup joints first, then interpolate all joints to target."""
         robot = hw.robot_wrapper
-        target = hw.initial_position
         try:
             current_obs = robot.get_observation()
             current_pos = {k: v for k, v in current_obs.items() if k in target}
-            steps = max(int(duration_s * fps), 1)
+            if not current_pos:
+                logger.warning("Could not infer robot joint positions for interpolation.")
+                return
+
+            RolloutStrategy._preopen_joint(
+                robot=robot,
+                current_pos=current_pos,
+                joint_name="joint_2",
+                preopen_deg=j2_preopen_deg,
+                duration_s=j2_preopen_time_s,
+                fps=fps,
+            )
+            if j2_preopen_deg > 0 and "joint_2.pos" in current_pos:
+                current_pos = {k: v for k, v in robot.get_observation().items() if k in target}
+
+            RolloutStrategy._preopen_joint(
+                robot=robot,
+                current_pos=current_pos,
+                joint_name="joint_4",
+                preopen_deg=j4_preopen_deg,
+                duration_s=j4_preopen_time_s,
+                fps=fps,
+            )
+            if j4_preopen_deg > 0 and "joint_4.pos" in current_pos:
+                current_pos = {k: v for k, v in robot.get_observation().items() if k in target}
+
+            if move_time_s <= 0:
+                return
+
+            steps = max(int(move_time_s * fps), 1)
+            control_interval = move_time_s / steps
             for step in range(1, steps + 1):
+                start_loop_t = time.perf_counter()
                 t = step / steps
                 interp = {}
                 for k in current_pos:
                     interp[k] = current_pos[k] * (1 - t) + target[k] * t
                 robot.send_action(interp)
-                precise_sleep(1 / fps)
+                dt_s = time.perf_counter() - start_loop_t
+                precise_sleep(max(control_interval - dt_s, 0.0))
         except Exception as e:
-            logger.warning("Could not return to initial position: %s", e)
+            logger.warning("Could not interpolate robot position: %s", e)
+
+    @staticmethod
+    def _preopen_joint(
+        robot,
+        current_pos: dict,
+        joint_name: str,
+        preopen_deg: float,
+        duration_s: float,
+        fps: int,
+    ) -> None:
+        """Move one joint in the arm's opening direction before full interpolation."""
+        joint_key = f"{joint_name}.pos"
+        if preopen_deg <= 0 or duration_s <= 0 or joint_key not in current_pos:
+            return
+
+        raw_robot = robot.inner
+        joint_limits = getattr(getattr(raw_robot, "config", None), "joint_limits", {})
+        limits = joint_limits.get(joint_name)
+
+        current_position = current_pos[joint_key]
+        open_direction = 1.0
+        if limits is not None:
+            min_limit, max_limit = limits
+            open_direction = 1.0 if abs(max_limit) >= abs(min_limit) else -1.0
+
+        preopen_position = current_position + open_direction * abs(preopen_deg)
+        if limits is not None:
+            min_limit, max_limit = limits
+            preopen_position = max(min_limit, min(max_limit, preopen_position))
+
+        logger.info("Pre-opening %s: %.2f -> %.2f deg", joint_name, current_position, preopen_position)
+
+        steps = max(int(duration_s * fps), 1)
+        control_interval = duration_s / steps
+        for step in range(1, steps + 1):
+            start_loop_t = time.perf_counter()
+            alpha = step / steps
+            action = dict(current_pos)
+            action[joint_key] = current_position + (preopen_position - current_position) * alpha
+            robot.send_action(action)
+
+            dt_s = time.perf_counter() - start_loop_t
+            precise_sleep(max(control_interval - dt_s, 0.0))
 
     @staticmethod
     def _log_telemetry(
