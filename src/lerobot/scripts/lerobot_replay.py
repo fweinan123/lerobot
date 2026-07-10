@@ -54,6 +54,7 @@ from lerobot.datasets import LeRobotDataset
 from lerobot.processor import (
     make_default_robot_action_processor,
 )
+from lerobot.rollout.configs import DEFAULT_MOVE_PATH_BEFORE_POLICY
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
@@ -99,6 +100,9 @@ class ReplayConfig:
     # Move the robot gradually from its current pose to the first episode action before replaying.
     # Set to 0 to start replay immediately.
     move_to_start_time_s: float = 2.0
+    # Move through rollout/configs.py DEFAULT_MOVE_PATH_BEFORE_POLICY before replaying.
+    move_path_before_replay: bool = True
+    move_path_before_replay_time_s: float = 1.0
 
 
 @parser.wrap()
@@ -118,6 +122,18 @@ def replay(cfg: ReplayConfig):
     try:
         if cfg.move_to_start_time_s < 0:
             raise ValueError("move_to_start_time_s must be greater than or equal to 0.")
+        if cfg.move_path_before_replay_time_s < 0:
+            raise ValueError("move_path_before_replay_time_s must be greater than or equal to 0.")
+
+        if cfg.move_path_before_replay and DEFAULT_MOVE_PATH_BEFORE_POLICY:
+            log_say("Moving through replay safety path", cfg.play_sounds, blocking=True)
+            _move_through_configured_path(
+                robot=robot,
+                robot_action_processor=robot_action_processor,
+                path=DEFAULT_MOVE_PATH_BEFORE_POLICY,
+                move_time_s=cfg.move_path_before_replay_time_s,
+                fps=dataset.fps,
+            )
 
         if cfg.move_to_start_time_s > 0 and dataset.num_frames > 0:
             log_say("Moving to episode start", cfg.play_sounds, blocking=True)
@@ -182,6 +198,80 @@ def _move_to_start_pose(
         action = target_action.copy()
         for name, start_value in start_action.items():
             action[name] = float(start_value) + (float(target_action[name]) - float(start_value)) * alpha
+
+        robot_obs = robot.get_observation()
+        processed_action = robot_action_processor((action, robot_obs))
+        robot.send_action(processed_action)
+
+        dt_s = time.perf_counter() - start_loop_t
+        precise_sleep(max(control_interval - dt_s, 0.0))
+
+
+def _move_through_configured_path(
+    robot: Robot,
+    robot_action_processor,
+    path: list[list[float]],
+    move_time_s: float,
+    fps: int,
+) -> None:
+    joint_keys = [f"joint_{idx}.pos" for idx in range(1, 8)]
+
+    for waypoint_idx, waypoint in enumerate(path, start=1):
+        if len(waypoint) != len(joint_keys):
+            logging.warning(
+                "Skipping replay safety waypoint %d: expected 7 values, got %d",
+                waypoint_idx,
+                len(waypoint),
+            )
+            continue
+
+        robot_obs = robot.get_observation()
+        missing_keys = [key for key in joint_keys if key not in robot_obs]
+        if missing_keys:
+            logging.warning(
+                "Skipping replay safety waypoint %d: missing robot observation keys %s",
+                waypoint_idx,
+                missing_keys,
+            )
+            continue
+
+        start_action = {key: float(robot_obs[key]) for key in joint_keys}
+        target_action = {key: float(value) for key, value in zip(joint_keys, waypoint, strict=True)}
+        logging.info("Moving to replay safety waypoint %d/%d: %s", waypoint_idx, len(path), target_action)
+
+        _interpolate_robot_action(
+            robot=robot,
+            robot_action_processor=robot_action_processor,
+            start_action=start_action,
+            target_action=target_action,
+            move_time_s=move_time_s,
+            fps=fps,
+        )
+
+
+def _interpolate_robot_action(
+    robot: Robot,
+    robot_action_processor,
+    start_action: dict,
+    target_action: dict,
+    move_time_s: float,
+    fps: int,
+) -> None:
+    if move_time_s <= 0:
+        robot_obs = robot.get_observation()
+        processed_action = robot_action_processor((target_action, robot_obs))
+        robot.send_action(processed_action)
+        return
+
+    num_steps = max(1, math.ceil(move_time_s * fps))
+    control_interval = move_time_s / num_steps
+    for step in range(1, num_steps + 1):
+        start_loop_t = time.perf_counter()
+        alpha = step / num_steps
+        action = {}
+        for key, target_value in target_action.items():
+            start_value = float(start_action.get(key, target_value))
+            action[key] = start_value + (float(target_value) - start_value) * alpha
 
         robot_obs = robot.get_observation()
         processed_action = robot_action_processor((action, robot_obs))
