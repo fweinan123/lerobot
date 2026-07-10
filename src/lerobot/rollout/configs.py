@@ -33,6 +33,13 @@ from .inference import InferenceEngineConfig, SyncInferenceConfig
 logger = logging.getLogger(__name__)
 
 
+DEFAULT_MOVE_PATH_BEFORE_POLICY: list[list[float]] = [[-3.7048, 21.846, -2.1092, 0.7322, 5.956, 3.049, 3.508],
+ [-11.2891, 43.0254, -2.1092, 0.7541, 13.6278, 23.4197, 35.4629],
+ [-52.096, 38.8944, 40.9271, 60.9262, 10.5897, 28.3594, 37.736],
+ [-38.4354, 47.3312, 29.5834, 91.6134, 13.4092, 40.3588, 8.7974],
+ [-38.4354, 47.3093, 24.9934, 97.8863, 18.5893, 40.337, 10.1088]]
+
+
 # ---------------------------------------------------------------------------
 # Strategy configs (polymorphic dispatch via draccus ChoiceRegistry)
 # ---------------------------------------------------------------------------
@@ -210,14 +217,19 @@ class RolloutConfig:
     rename_map: dict[str, str] = field(default_factory=dict)
 
     # Hardware startup
-    # Before policy control starts, move joint_2 away from the direct path.
-    # Set move_to_initial_position_time_s > 0 to also interpolate back to the
-    # robot pose captured at startup.
+    # Before policy control starts, optionally move through recorded arm waypoints.
+    # Each waypoint is [joint_1, ..., joint_7] in degrees. The gripper keeps its
+    # current position during this pre-policy path.
     move_to_initial_position_on_start: bool = True
+    move_path_before_policy: list[list[float]] = field(
+        default_factory=lambda: [point.copy() for point in DEFAULT_MOVE_PATH_BEFORE_POLICY]
+    )
+    move_path_before_policy_time_s: float = 1.0
+    # Backward-compatible fallback used when move_path_before_policy is empty.
     move_to_initial_position_time_s: float = 0.0
-    start_j2_preopen_deg: float = 70.0
+    start_j2_preopen_deg: float = 80.0
     start_j2_preopen_time_s: float = 1.0
-    start_j4_preopen_deg: float = 80.0
+    start_j4_preopen_deg: float = 100.0
     start_j4_preopen_time_s: float = 1.0
     first_policy_action_transition_time_s: float = 1.0
 

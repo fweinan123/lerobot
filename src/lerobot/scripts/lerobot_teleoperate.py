@@ -53,15 +53,18 @@ lerobot-teleoperate \
 
 """
 
+import ast
 import logging
 import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from pprint import pformat
 
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.orbbec import OrbbecCameraConfig  # noqa: F401
 from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.cameras.zmq import ZMQCameraConfig  # noqa: F401
+from lerobot.common.control_utils import is_headless
 from lerobot.configs import parser
 from lerobot.processor import (
     RobotAction,
@@ -106,6 +109,10 @@ from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging, move_cursor_up
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data, shutdown_rerun
 
+ROLLOUT_CONFIG_PATH = Path(__file__).parents[1] / "rollout" / "configs.py"
+MOVE_PATH_CONSTANT = "DEFAULT_MOVE_PATH_BEFORE_POLICY"
+MOVE_PATH_JOINT_KEYS = [f"joint_{idx}.pos" for idx in range(1, 8)]
+
 
 @dataclass
 class TeleoperateConfig:
@@ -123,6 +130,9 @@ class TeleoperateConfig:
     display_port: int | None = None
     # Whether to  display compressed images in Rerun
     display_compressed_images: bool = False
+    # When True, pressing space records the current robot joint_1..joint_7
+    # positions into rollout/configs.py for pre-policy startup motion.
+    move_path_before_policy_record: bool = False
 
 
 def teleop_loop(
@@ -135,6 +145,7 @@ def teleop_loop(
     display_data: bool = False,
     duration: float | None = None,
     display_compressed_images: bool = False,
+    move_path_before_policy_record: bool = False,
 ):
     """
     This function continuously reads actions from a teleoperation device, processes them through optional
@@ -154,56 +165,155 @@ def teleop_loop(
     """
 
     display_len = max(len(key) for key in robot.action_features)
+    listener = None
+    events = {"record_move_path_waypoint": False, "stop_recording": False}
+    recorded_waypoints = _load_move_path_before_policy() if move_path_before_policy_record else []
+    if move_path_before_policy_record:
+        listener, events = _init_move_path_keyboard_listener()
+        logging.info(
+            "Pre-policy path recording enabled. Press SPACE to append current joint_1..joint_7 pose; ESC to exit."
+        )
+
     start = time.perf_counter()
-    while True:
-        loop_start = time.perf_counter()
+    try:
+        while True:
+            loop_start = time.perf_counter()
 
-        # Get robot observation
-        # Not really needed for now other than for visualization
-        # teleop_action_processor can take None as an observation
-        # given that it is the identity processor as default
-        obs = robot.get_observation()
+            # Get robot observation
+            # Not really needed for now other than for visualization
+            # teleop_action_processor can take None as an observation
+            # given that it is the identity processor as default
+            obs = robot.get_observation()
 
-        if robot.name == "unitree_g1":
-            teleop.send_feedback(obs)
+            if move_path_before_policy_record and events.pop("record_move_path_waypoint", False):
+                waypoint = _extract_move_path_waypoint(obs)
+                recorded_waypoints.append(waypoint)
+                _write_move_path_before_policy(recorded_waypoints)
+                logging.info("Recorded pre-policy waypoint %d: %s", len(recorded_waypoints), waypoint)
 
-        # Get teleop action
-        raw_action = teleop.get_action()
+            if move_path_before_policy_record and events.get("stop_recording", False):
+                return
 
-        # Process teleop action through pipeline
-        teleop_action = teleop_action_processor((raw_action, obs))
+            if robot.name == "unitree_g1":
+                teleop.send_feedback(obs)
 
-        # Process action for robot through pipeline
-        robot_action_to_send = robot_action_processor((teleop_action, obs))
+            # Get teleop action
+            raw_action = teleop.get_action()
 
-        # Send processed action to robot (robot_action_processor.to_output should return RobotAction)
-        _ = robot.send_action(robot_action_to_send)
+            # Process teleop action through pipeline
+            teleop_action = teleop_action_processor((raw_action, obs))
 
-        if display_data:
-            # Process robot observation through pipeline
-            obs_transition = robot_observation_processor(obs)
+            # Process action for robot through pipeline
+            robot_action_to_send = robot_action_processor((teleop_action, obs))
 
-            log_rerun_data(
-                observation=obs_transition,
-                action=teleop_action,
-                compress_images=display_compressed_images,
-            )
+            # Send processed action to robot (robot_action_processor.to_output should return RobotAction)
+            _ = robot.send_action(robot_action_to_send)
 
-            print("\n" + "-" * (display_len + 10))
-            print(f"{'NAME':<{display_len}} | {'NORM':>7}")
-            # Display the final robot action that was sent
-            for motor, value in robot_action_to_send.items():
-                print(f"{motor:<{display_len}} | {value:>7.2f}")
-            move_cursor_up(len(robot_action_to_send) + 3)
+            if display_data:
+                # Process robot observation through pipeline
+                obs_transition = robot_observation_processor(obs)
 
-        dt_s = time.perf_counter() - loop_start
-        precise_sleep(max(1 / fps - dt_s, 0.0))
-        loop_s = time.perf_counter() - loop_start
-        print(f"Teleop loop time: {loop_s * 1e3:.2f}ms ({1 / loop_s:.0f} Hz)")
-        move_cursor_up(1)
+                log_rerun_data(
+                    observation=obs_transition,
+                    action=teleop_action,
+                    compress_images=display_compressed_images,
+                )
 
-        if duration is not None and time.perf_counter() - start >= duration:
+                print("\n" + "-" * (display_len + 10))
+                print(f"{'NAME':<{display_len}} | {'NORM':>7}")
+                # Display the final robot action that was sent
+                for motor, value in robot_action_to_send.items():
+                    print(f"{motor:<{display_len}} | {value:>7.2f}")
+                move_cursor_up(len(robot_action_to_send) + 3)
+
+            dt_s = time.perf_counter() - loop_start
+            precise_sleep(max(1 / fps - dt_s, 0.0))
+            loop_s = time.perf_counter() - loop_start
+            print(f"Teleop loop time: {loop_s * 1e3:.2f}ms ({1 / loop_s:.0f} Hz)")
+            move_cursor_up(1)
+
+            if duration is not None and time.perf_counter() - start >= duration:
+                return
+    finally:
+        if listener is not None:
+            listener.stop()
+
+
+def _init_move_path_keyboard_listener():
+    events = {"record_move_path_waypoint": False, "stop_recording": False}
+    if is_headless():
+        logging.warning("Headless environment detected; pre-policy path keyboard recording disabled")
+        return None, events
+
+    try:
+        from pynput import keyboard
+    except Exception:
+        logging.warning("pynput unavailable; pre-policy path keyboard recording disabled")
+        return None, events
+
+    def on_press(key):
+        if key == keyboard.Key.space:
+            print("Space key pressed. Recording pre-policy waypoint...")
+            events["record_move_path_waypoint"] = True
+        elif key == keyboard.Key.esc:
+            print("Escape key pressed. Stopping pre-policy path recording...")
+            events["stop_recording"] = True
+
+    listener = keyboard.Listener(on_press=on_press)
+    listener.start()
+    return listener, events
+
+
+def _extract_move_path_waypoint(obs: RobotObservation) -> list[float]:
+    missing_keys = [key for key in MOVE_PATH_JOINT_KEYS if key not in obs]
+    if missing_keys:
+        raise KeyError(f"Cannot record pre-policy waypoint; missing robot observation keys: {missing_keys}")
+    return [round(float(obs[key]), 4) for key in MOVE_PATH_JOINT_KEYS]
+
+
+def _load_move_path_before_policy() -> list[list[float]]:
+    tree = ast.parse(ROLLOUT_CONFIG_PATH.read_text())
+    for node in tree.body:
+        if (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == MOVE_PATH_CONSTANT
+        ):
+            value = ast.literal_eval(node.value)
+            return [list(point) for point in value]
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == MOVE_PATH_CONSTANT:
+                    value = ast.literal_eval(node.value)
+                    return [list(point) for point in value]
+    return []
+
+
+def _write_move_path_before_policy(path: list[list[float]]) -> None:
+    source = ROLLOUT_CONFIG_PATH.read_text()
+    tree = ast.parse(source)
+    for node in tree.body:
+        if (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == MOVE_PATH_CONSTANT
+        ):
+            old = ast.get_source_segment(source, node)
+            if old is None:
+                raise RuntimeError(f"Could not update {MOVE_PATH_CONSTANT} in {ROLLOUT_CONFIG_PATH}")
+            new = f"{MOVE_PATH_CONSTANT}: list[list[float]] = {pformat(path, width=120)}"
+            ROLLOUT_CONFIG_PATH.write_text(source.replace(old, new, 1))
             return
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == MOVE_PATH_CONSTANT:
+                    old = ast.get_source_segment(source, node)
+                    if old is None:
+                        raise RuntimeError(f"Could not update {MOVE_PATH_CONSTANT} in {ROLLOUT_CONFIG_PATH}")
+                    new = f"{MOVE_PATH_CONSTANT}: list[list[float]] = {pformat(path, width=120)}"
+                    ROLLOUT_CONFIG_PATH.write_text(source.replace(old, new, 1))
+                    return
+    raise RuntimeError(f"Could not find {MOVE_PATH_CONSTANT} in {ROLLOUT_CONFIG_PATH}")
 
 
 @parser.wrap()
@@ -236,6 +346,7 @@ def teleoperate(cfg: TeleoperateConfig):
             robot_action_processor=robot_action_processor,
             robot_observation_processor=robot_observation_processor,
             display_compressed_images=display_compressed_images,
+            move_path_before_policy_record=cfg.move_path_before_policy_record,
         )
     except KeyboardInterrupt:
         pass

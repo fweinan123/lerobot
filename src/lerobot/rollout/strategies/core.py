@@ -155,7 +155,7 @@ class RolloutStrategy(abc.ABC):
             logger.warning("Could not prime action interpolator from robot pose: %s", e)
 
     def _move_to_initial_position_before_start(self, ctx: RolloutContext) -> None:
-        """Move through a safer joint_2 pose before policy control starts."""
+        """Move through configured startup poses before policy control starts."""
         cfg = ctx.runtime.cfg
         hw = ctx.hardware
         if self._did_startup_move:
@@ -166,6 +166,19 @@ class RolloutStrategy(abc.ABC):
             return
         if not hw.initial_position:
             logger.warning("No initial robot position captured; skipping startup move-to-initial.")
+            return
+
+        if cfg.move_path_before_policy:
+            logger.info(
+                "Preparing rollout start pose: moving through %d configured pre-policy waypoint(s)",
+                len(cfg.move_path_before_policy),
+            )
+            self._move_through_startup_path(
+                hw=hw,
+                path=cfg.move_path_before_policy,
+                move_time_s=cfg.move_path_before_policy_time_s,
+                fps=max(int(cfg.fps), 1),
+            )
             return
 
         logger.info(
@@ -262,22 +275,84 @@ class RolloutStrategy(abc.ABC):
             if j4_preopen_deg > 0 and "joint_4.pos" in current_pos:
                 current_pos = {k: v for k, v in robot.get_observation().items() if k in target}
 
-            if move_time_s <= 0:
-                return
-
-            steps = max(int(move_time_s * fps), 1)
-            control_interval = move_time_s / steps
-            for step in range(1, steps + 1):
-                start_loop_t = time.perf_counter()
-                t = step / steps
-                interp = {}
-                for k in current_pos:
-                    interp[k] = current_pos[k] * (1 - t) + target[k] * t
-                robot.send_action(interp)
-                dt_s = time.perf_counter() - start_loop_t
-                precise_sleep(max(control_interval - dt_s, 0.0))
+            if move_time_s > 0:
+                RolloutStrategy._interpolate_robot_action(
+                    robot=robot,
+                    current_pos=current_pos,
+                    target={key: target[key] for key in current_pos},
+                    move_time_s=move_time_s,
+                    fps=fps,
+                )
         except Exception as e:
             logger.warning("Could not interpolate robot position: %s", e)
+
+    @staticmethod
+    def _move_through_startup_path(
+        hw: HardwareContext,
+        path: list[list[float]],
+        move_time_s: float,
+        fps: int,
+    ) -> None:
+        """Interpolate robot arm joints through [joint_1, ..., joint_7] waypoints."""
+        robot = hw.robot_wrapper
+        joint_keys = [f"joint_{idx}.pos" for idx in range(1, 8)]
+        try:
+            for waypoint_idx, waypoint in enumerate(path, start=1):
+                if len(waypoint) != len(joint_keys):
+                    logger.warning(
+                        "Skipping pre-policy waypoint %d: expected 7 values, got %d",
+                        waypoint_idx,
+                        len(waypoint),
+                    )
+                    continue
+
+                current_obs = robot.get_observation()
+                missing_keys = [key for key in joint_keys if key not in current_obs]
+                if missing_keys:
+                    logger.warning(
+                        "Skipping pre-policy waypoint %d: missing robot observation keys %s",
+                        waypoint_idx,
+                        missing_keys,
+                    )
+                    continue
+
+                current_pos = {key: float(current_obs[key]) for key in joint_keys}
+                target = {key: float(value) for key, value in zip(joint_keys, waypoint, strict=True)}
+                logger.info("Moving to pre-policy waypoint %d/%d: %s", waypoint_idx, len(path), target)
+                RolloutStrategy._interpolate_robot_action(
+                    robot=robot,
+                    current_pos=current_pos,
+                    target=target,
+                    move_time_s=move_time_s,
+                    fps=fps,
+                )
+        except Exception as e:
+            logger.warning("Could not move through pre-policy path: %s", e)
+
+    @staticmethod
+    def _interpolate_robot_action(
+        robot,
+        current_pos: dict,
+        target: dict,
+        move_time_s: float,
+        fps: int,
+    ) -> None:
+        if move_time_s <= 0:
+            robot.send_action(target)
+            return
+
+        steps = max(int(move_time_s * fps), 1)
+        control_interval = move_time_s / steps
+        for step in range(1, steps + 1):
+            start_loop_t = time.perf_counter()
+            t = step / steps
+            interp = {}
+            for key, target_value in target.items():
+                current_value = current_pos.get(key, target_value)
+                interp[key] = current_value * (1 - t) + target_value * t
+            robot.send_action(interp)
+            dt_s = time.perf_counter() - start_loop_t
+            precise_sleep(max(control_interval - dt_s, 0.0))
 
     @staticmethod
     def _preopen_joint(
