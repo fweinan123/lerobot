@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import dataclasses
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -328,9 +329,95 @@ def test_dagger_events_reset():
     events.request_transition("pause_resume")
     events.consume_transition()  # -> PAUSED
     events.upload_requested.set()
+    events.leader_hold_active.set()
     events.reset()
     assert events.phase == DAggerPhase.AUTONOMOUS
     assert not events.upload_requested.is_set()
+    assert not events.leader_hold_active.is_set()
+
+
+def test_dagger_sync_leader_enables_paused_hold():
+    from lerobot.rollout.strategies import DAggerEvents, DAggerPhase
+    from lerobot.rollout.strategies.dagger import _handle_sync_leader_request
+
+    teleop = MagicMock()
+    teleop.sync_to_action = MagicMock()
+    robot = MagicMock()
+    robot.get_observation.return_value = {f"joint_{idx}.pos": float(idx) for idx in range(1, 8)}
+    ctx = SimpleNamespace(
+        hardware=SimpleNamespace(teleop=teleop, robot_wrapper=robot),
+        runtime=SimpleNamespace(cfg=SimpleNamespace(fps=30)),
+    )
+
+    events = DAggerEvents()
+    events.phase = DAggerPhase.PAUSED
+    events.sync_leader_requested.set()
+
+    _handle_sync_leader_request(ctx, events, play_sounds=False)
+
+    assert events.leader_hold_active.is_set()
+    teleop.sync_to_action.assert_called_once()
+
+
+def test_dagger_holds_leader_after_correction_and_powers_off_when_policy_resumes():
+    from lerobot.rollout.strategies import DAggerPhase
+    from lerobot.rollout.strategies.dagger import DAggerStrategy
+
+    class HoldingTeleop:
+        feedback_features = {}
+
+        def __init__(self):
+            self.hold_count = 0
+            self.release_count = 0
+            self.bus = MagicMock()
+
+        def hold_position(self):
+            self.hold_count += 1
+
+        def release_for_manual_control(self):
+            self.release_count += 1
+
+    teleop = HoldingTeleop()
+    ctx = SimpleNamespace(
+        hardware=SimpleNamespace(teleop=teleop, robot_wrapper=MagicMock()),
+        processors=MagicMock(),
+    )
+    engine = MagicMock()
+    interpolator = MagicMock()
+
+    DAggerStrategy._apply_transition(
+        DAggerPhase.PAUSED,
+        DAggerPhase.CORRECTING,
+        engine,
+        interpolator,
+        ctx,
+        prev_action=None,
+    )
+    assert teleop.release_count == 1
+    assert teleop.hold_count == 0
+
+    DAggerStrategy._apply_transition(
+        DAggerPhase.CORRECTING,
+        DAggerPhase.PAUSED,
+        engine,
+        interpolator,
+        ctx,
+        prev_action=None,
+    )
+    assert teleop.release_count == 1
+    assert teleop.hold_count == 1
+
+    DAggerStrategy._apply_transition(
+        DAggerPhase.PAUSED,
+        DAggerPhase.AUTONOMOUS,
+        engine,
+        interpolator,
+        ctx,
+        prev_action=None,
+    )
+    assert teleop.release_count == 1
+    assert teleop.hold_count == 1
+    teleop.bus.disable_torque.assert_called_once_with()
 
 
 # ---------------------------------------------------------------------------

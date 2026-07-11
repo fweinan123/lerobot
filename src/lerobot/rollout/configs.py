@@ -113,6 +113,7 @@ class DAggerKeyboardConfig:
     pause_resume: str = "space"
     correction: str = "tab"
     upload: str = "enter"
+    sync_leader: str = "t"
 
 
 @dataclass

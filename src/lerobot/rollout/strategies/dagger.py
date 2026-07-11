@@ -24,6 +24,7 @@ the ``input_device`` config field.  Each device exposes three actions:
     1. **pause_resume** — Toggle policy execution (AUTONOMOUS <-> PAUSED).
     2. **correction**   — Toggle correction recording (PAUSED <-> CORRECTING).
     3. **upload**        — Push dataset to hub on demand (corrections-only mode).
+    4. **sync_leader**   — Move the leader to the follower's current joint pose.
     ESC (keyboard only) — Stop session.
 
 Recording modes:
@@ -39,7 +40,9 @@ Teleoperator handover:
     the follower's last position via ``send_feedback`` so the operator takes
     over without a jerk.  Non-actuated teleops cannot be driven,
     so on PAUSED → CORRECTING the follower is instead slid to the teleop's
-    current pose before the correction begins.
+    current pose before the correction begins.  On CORRECTING → PAUSED, the
+    leader is held at its current pose until PAUSED → AUTONOMOUS powers it off
+    while policy control resumes.
 """
 
 from __future__ import annotations
@@ -125,6 +128,9 @@ class DAggerEvents:
         # Session-level flags
         self.stop_recording = Event()
         self.upload_requested = Event()
+        self.sync_leader_requested = Event()
+        self.leader_hold_active = Event()
+        self._leader_hold_target: dict[str, float] | None = None
 
     # -- Thread-safe phase access ------------------------------------------
 
@@ -168,7 +174,27 @@ class DAggerEvents:
         with self._lock:
             self._phase = DAggerPhase.AUTONOMOUS
             self._pending_transition = None
+            self._leader_hold_target = None
         self.upload_requested.clear()
+        self.sync_leader_requested.clear()
+        self.leader_hold_active.clear()
+
+    def set_leader_hold_target(self, target: dict[str, float]) -> None:
+        """Store the leader pose that should be actively maintained while paused."""
+        with self._lock:
+            self._leader_hold_target = dict(target)
+        self.leader_hold_active.set()
+
+    def clear_leader_hold(self) -> None:
+        """Stop actively holding the leader pose."""
+        with self._lock:
+            self._leader_hold_target = None
+        self.leader_hold_active.clear()
+
+    def get_leader_hold_target(self) -> dict[str, float] | None:
+        """Return the currently requested leader hold target, if any."""
+        with self._lock:
+            return None if self._leader_hold_target is None else dict(self._leader_hold_target)
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +211,106 @@ def _teleop_supports_feedback(teleop: Teleoperator) -> bool:
         and hasattr(teleop, "disable_torque")
         and hasattr(teleop, "enable_torque")
     )
+
+
+def _release_teleop_for_manual_control(teleop: Teleoperator | None) -> None:
+    """Release a teleoperator after automated alignment/holding."""
+    if teleop is None:
+        return
+    if hasattr(teleop, "release_for_manual_control"):
+        teleop.release_for_manual_control()
+    elif _teleop_supports_feedback(teleop):
+        teleop.disable_torque()
+
+
+def _power_off_teleop_for_policy_control(teleop: Teleoperator | None) -> None:
+    """Make the leader passive when autonomous policy control resumes."""
+    if teleop is None:
+        return
+    if hasattr(teleop, "disable_torque"):
+        teleop.disable_torque()
+    elif hasattr(teleop, "bus") and hasattr(teleop.bus, "disable_torque"):
+        teleop.bus.disable_torque()
+    elif hasattr(teleop, "release_for_manual_control"):
+        teleop.release_for_manual_control()
+    elif _teleop_supports_feedback(teleop):
+        teleop.disable_torque()
+
+    for attr, value in (
+        ("_hold_torque_enabled", False),
+        ("_hold_positions", None),
+        ("_manual_gravity_compensation_paused", True),
+    ):
+        if hasattr(teleop, attr):
+            with contextlib.suppress(Exception):
+                setattr(teleop, attr, value)
+
+
+def _hold_teleop_at_current_position(teleop: Teleoperator | None) -> None:
+    """Hold a teleoperator at its current pose until control is handed back."""
+    if teleop is None:
+        return
+    if hasattr(teleop, "hold_position"):
+        teleop.hold_position()
+        return
+    if _teleop_supports_feedback(teleop):
+        current_position = teleop.get_action()
+        teleop.enable_torque()
+        teleop.send_feedback(current_position)
+
+
+def _get_teleop_hold_target(teleop: Teleoperator | None) -> dict[str, float] | None:
+    """Read the currently held leader target without releasing the leader."""
+    if teleop is None:
+        return None
+    hold_positions = getattr(teleop, "_hold_positions", None)
+    if hold_positions:
+        return {
+            key if key.endswith(".pos") else f"{key}.pos": float(value)
+            for key, value in hold_positions.items()
+            if value is not None
+        }
+    if _teleop_supports_feedback(teleop):
+        return teleop.get_action()
+    return None
+
+
+def _hold_teleop_at_target(teleop: Teleoperator | None, target: dict[str, float] | None) -> None:
+    """Continuously command a teleoperator to hold a specific target pose."""
+    if teleop is None:
+        return
+    if target is None:
+        _hold_teleop_at_current_position(teleop)
+        return
+
+    # OpenArm leader exposes position holding through its CAN MIT helper; keep
+    # sending the target so the arm does not fall passive between sync and tab.
+    if hasattr(teleop, "_send_hold_position") and hasattr(teleop, "bus"):
+        positions = {
+            key.removesuffix(".pos"): float(value)
+            for key, value in target.items()
+            if key.endswith(".pos")
+        }
+        positions.update({key: float(value) for key, value in target.items() if not key.endswith(".pos")})
+        if not positions:
+            raise RuntimeError("Cannot hold leader: target does not contain position keys.")
+        teleop.bus.enable_torque()
+        if hasattr(teleop, "_hold_torque_enabled"):
+            teleop._hold_torque_enabled = True
+        if hasattr(teleop, "_manual_gravity_compensation_paused"):
+            teleop._manual_gravity_compensation_paused = True
+        if hasattr(teleop, "_hold_positions"):
+            teleop._hold_positions = positions.copy()
+        teleop._send_hold_position(positions)
+        return
+
+    if _teleop_supports_feedback(teleop):
+        teleop.enable_torque()
+        teleop.send_feedback(target)
+        return
+
+    if hasattr(teleop, "hold_position"):
+        teleop.hold_position()
 
 
 def _teleop_smooth_move_to(
@@ -227,6 +353,54 @@ def _follower_smooth_move_to(
         interp = {k: current[k] * (1 - t) + target[k] * t if k in target else current[k] for k in current}
         robot.send_action(interp)
         time.sleep(1 / fps)
+
+
+def _sync_leader_to_follower(ctx: RolloutContext, duration_s: float = 1.0) -> dict[str, float] | None:
+    """Move an actuated leader to the follower's current joint_1..joint_7 pose."""
+    teleop = ctx.hardware.teleop
+    if teleop is None:
+        logger.warning("Cannot sync leader: no teleoperator configured")
+        return None
+
+    robot = ctx.hardware.robot_wrapper
+    obs = robot.get_observation()
+    target = {f"joint_{idx}.pos": obs[f"joint_{idx}.pos"] for idx in range(1, 8) if f"joint_{idx}.pos" in obs}
+    if len(target) != 7:
+        logger.warning("Cannot sync leader: follower observation is missing joint keys (%s)", sorted(target))
+        return None
+
+    if hasattr(teleop, "sync_to_action"):
+        logger.info("Syncing leader to follower joint pose via teleop.sync_to_action")
+        synced_target = teleop.sync_to_action(target, duration_s=duration_s, fps=max(int(ctx.runtime.cfg.fps), 1))
+        return synced_target if isinstance(synced_target, dict) else target
+
+    if _teleop_supports_feedback(teleop):
+        logger.info("Syncing leader to follower joint pose via teleop feedback")
+        _teleop_smooth_move_to(teleop, target, duration_s=duration_s, fps=max(int(ctx.runtime.cfg.fps), 1))
+        return target
+
+    logger.warning("Cannot sync leader: teleoperator %s does not support leader positioning", teleop.name)
+    return None
+
+
+def _handle_sync_leader_request(ctx: RolloutContext, events: DAggerEvents, play_sounds: bool) -> None:
+    if not events.sync_leader_requested.is_set():
+        return
+
+    events.sync_leader_requested.clear()
+    if events.phase != DAggerPhase.PAUSED:
+        logger.warning("Leader sync requested outside PAUSED phase; press pause before syncing leader")
+        log_say("Pause before syncing leader", play_sounds)
+        return
+
+    log_say("Syncing leader to follower", play_sounds, blocking=True)
+    try:
+        if hold_target := _sync_leader_to_follower(ctx):
+            events.set_leader_hold_target(hold_target)
+    except Exception as e:
+        logger.warning("Failed to sync leader to follower: %s", e)
+        events.clear_leader_hold()
+        log_say("Failed to sync leader", play_sounds)
 
 
 # ---------------------------------------------------------------------------
@@ -281,16 +455,19 @@ def _init_dagger_keyboard(events: DAggerEvents, cfg: DAggerKeyboardConfig):
                 events.request_transition(key_to_event[resolved])
             if resolved == cfg.upload:
                 events.upload_requested.set()
+            if resolved == cfg.sync_leader:
+                events.sync_leader_requested.set()
         except Exception as e:
             logger.debug("Key error: %s", e)
 
     listener = keyboard.Listener(on_press=on_press)
     listener.start()
     logger.info(
-        "DAgger keyboard listener started (pause_resume='%s', correction='%s', upload='%s', ESC=stop)",
+        "DAgger keyboard listener started (pause_resume='%s', correction='%s', upload='%s', sync_leader='%s', ESC=stop)",
         cfg.pause_resume,
         cfg.correction,
         cfg.upload,
+        cfg.sync_leader,
     )
     return listener
 
@@ -474,15 +651,25 @@ class DAggerStrategy(RolloutStrategy):
                         )
                         if new_phase == DAggerPhase.AUTONOMOUS:
                             last_action = None
+                            events.clear_leader_hold()
+                        if old_phase == DAggerPhase.PAUSED and new_phase == DAggerPhase.CORRECTING:
+                            events.clear_leader_hold()
+                        if old_phase == DAggerPhase.CORRECTING and new_phase == DAggerPhase.PAUSED:
+                            if hold_target := _get_teleop_hold_target(teleop):
+                                events.set_leader_hold_target(hold_target)
+                            else:
+                                events.leader_hold_active.set()
+
+                    _handle_sync_leader_request(ctx, events, play_sounds)
 
                     phase = events.phase
-                    obs = robot.get_observation()
 
                     # --- CORRECTING: human teleop control ---
                     # TODO(Steven): teleop runs at the same FPS as the policy. To
                     # decouple the two, sample teleop at its native rate and
                     # interpolate to the control loop's tick rate.
                     if phase == DAggerPhase.CORRECTING:
+                        obs = robot.get_observation()
                         obs_processed = ctx.processors.robot_observation_processor(obs)
                         teleop_action = teleop.get_action()
                         processed_teleop = ctx.processors.teleop_action_processor((teleop_action, obs))
@@ -504,11 +691,18 @@ class DAggerStrategy(RolloutStrategy):
 
                     # --- PAUSED: hold position ---
                     elif phase == DAggerPhase.PAUSED:
+                        if events.leader_hold_active.is_set():
+                            try:
+                                _hold_teleop_at_target(teleop, events.get_leader_hold_target())
+                            except Exception as e:
+                                logger.warning("Failed to maintain leader hold: %s", e)
+                                events.clear_leader_hold()
                         if last_action:
                             robot.send_action(last_action)
 
                     # --- AUTONOMOUS: policy control ---
                     else:
+                        obs = robot.get_observation()
                         obs_processed = self._process_observation_and_notify(ctx.processors, obs)
 
                         if self._handle_warmup(cfg.use_torch_compile, loop_start, control_interval):
@@ -635,6 +829,14 @@ class DAggerStrategy(RolloutStrategy):
                         )
                         if new_phase == DAggerPhase.AUTONOMOUS:
                             last_action = None
+                            events.clear_leader_hold()
+                        if old_phase == DAggerPhase.PAUSED and new_phase == DAggerPhase.CORRECTING:
+                            events.clear_leader_hold()
+                        if old_phase == DAggerPhase.CORRECTING and new_phase == DAggerPhase.PAUSED:
+                            if hold_target := _get_teleop_hold_target(teleop):
+                                events.set_leader_hold_target(hold_target)
+                            else:
+                                events.leader_hold_active.set()
 
                         # Correction ended -> save episode (blocking if not streaming)
                         if old_phase == DAggerPhase.CORRECTING and new_phase == DAggerPhase.PAUSED:
@@ -655,14 +857,16 @@ class DAggerStrategy(RolloutStrategy):
                         logger.info("Upload requested by user")
                         self._background_push(dataset, cfg)
 
+                    _handle_sync_leader_request(ctx, events, play_sounds)
+
                     phase = events.phase
-                    obs = robot.get_observation()
 
                     # --- CORRECTING: human teleop control + recording ---
                     # TODO(Steven): teleop runs at the same FPS as the policy. To
                     # decouple the two, sample teleop at its native rate and
                     # interpolate to the control loop's tick rate.
                     if phase == DAggerPhase.CORRECTING:
+                        obs = robot.get_observation()
                         obs_processed = ctx.processors.robot_observation_processor(obs)
                         teleop_action = teleop.get_action()
                         processed_teleop = ctx.processors.teleop_action_processor((teleop_action, obs))
@@ -686,11 +890,18 @@ class DAggerStrategy(RolloutStrategy):
 
                     # --- PAUSED: hold position ---
                     elif phase == DAggerPhase.PAUSED:
+                        if events.leader_hold_active.is_set():
+                            try:
+                                _hold_teleop_at_target(teleop, events.get_leader_hold_target())
+                            except Exception as e:
+                                logger.warning("Failed to maintain leader hold: %s", e)
+                                events.clear_leader_hold()
                         if last_action:
                             robot.send_action(last_action)
 
                     # --- AUTONOMOUS: policy control (no recording) ---
                     else:
+                        obs = robot.get_observation()
                         obs_processed = self._process_observation_and_notify(ctx.processors, obs)
 
                         if self._handle_warmup(cfg.use_torch_compile, loop_start, control_interval):
@@ -741,12 +952,13 @@ class DAggerStrategy(RolloutStrategy):
             Slide the follower to the teleop's current pose so the robot meets
             the operator's hand rather than jumping to it on the first frame.
 
-        CORRECTING -> PAUSED (actuated teleop):
-            Re-enable torque to hold position after correction.
-            This will be potentially useful if cancelling the correction recording
+        CORRECTING -> PAUSED:
+            Hold the leader at the correction endpoint.  It is released only
+            when the operator resumes autonomous policy control.
 
         PAUSED -> AUTONOMOUS:
-            Reset and resume the inference engine.
+            Reset and resume the inference engine, then power off the leader
+            until the next pause/sync cycle.
         """
         teleop = ctx.hardware.teleop
         robot = ctx.hardware.robot_wrapper
@@ -776,12 +988,15 @@ class DAggerStrategy(RolloutStrategy):
                 _follower_smooth_move_to(robot, prev_action, target)
 
             # unlock the teleop for human control
-            if _teleop_supports_feedback(teleop):
-                teleop.disable_torque()
+            _release_teleop_for_manual_control(teleop)
 
         elif old_phase == DAggerPhase.CORRECTING and new_phase == DAggerPhase.PAUSED:
-            if _teleop_supports_feedback(teleop):
-                teleop.enable_torque()
+            logger.info("Correction ended - holding leader until policy resumes")
+            try:
+                _hold_teleop_at_current_position(teleop)
+            except Exception as e:
+                logger.warning("Failed to hold leader after correction: %s", e)
+                _release_teleop_for_manual_control(teleop)
 
         elif new_phase == DAggerPhase.AUTONOMOUS:
             logger.info("Resuming autonomous mode - resetting engine and interpolator")
@@ -789,9 +1004,8 @@ class DAggerStrategy(RolloutStrategy):
             engine.reset()
             engine.resume()
 
-            # release teleop before resuming the policy
-            if _teleop_supports_feedback(teleop):
-                teleop.disable_torque()
+            # Policy is back in control; make the leader passive/down-powered.
+            _power_off_teleop_for_policy_control(teleop)
 
     # ------------------------------------------------------------------
     # Background push (shared by both modes)

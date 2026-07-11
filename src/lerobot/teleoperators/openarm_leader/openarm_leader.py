@@ -14,10 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import logging
 import math
-from pathlib import Path
 import time
+from pathlib import Path
 from typing import Any
 
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
@@ -244,11 +245,63 @@ class OpenArmLeader(Teleoperator):
             self._manual_gravity_compensation_paused = True
         elif self.config.gravity_compensation:
             self._manual_gravity_compensation_paused = False
+            with contextlib.suppress(Exception):
+                self._apply_gravity_compensation(self.bus.sync_read_all_states())
         else:
             self.bus.disable_torque()
             self._manual_gravity_compensation_paused = True
         self._hold_torque_enabled = False
         self._hold_positions = None
+
+    @check_if_not_connected
+    def sync_to_action(
+        self,
+        target_pos: dict[str, float],
+        duration_s: float = 1.0,
+        fps: int = 30,
+    ) -> RobotAction:
+        """Move the leader's arm joints to a follower joint pose."""
+        target_positions = {}
+        for idx in range(1, 8):
+            motor_name = f"joint_{idx}"
+            action_key = f"{motor_name}.pos"
+            if action_key in target_pos and motor_name in self.bus.motors:
+                target_positions[motor_name] = float(target_pos[action_key])
+
+        if not target_positions:
+            raise ValueError("Cannot sync OpenArm leader; target_pos does not contain joint_1..joint_7 positions.")
+
+        states = self.bus.sync_read_all_states()
+        current_positions = {
+            motor_name: float(states[motor_name]["position"])
+            for motor_name in target_positions
+            if motor_name in states and states[motor_name].get("position") is not None
+        }
+        missing_positions = sorted(set(target_positions) - set(current_positions))
+        if missing_positions:
+            raise RuntimeError(f"Cannot sync OpenArm leader; missing current positions: {missing_positions}")
+
+        self.bus.enable_torque()
+        self._hold_torque_enabled = True
+        self._manual_gravity_compensation_paused = True
+
+        steps = max(int(duration_s * fps), 1) if duration_s > 0 else 1
+        control_interval = duration_s / steps if duration_s > 0 else 0.0
+        for step in range(1, steps + 1):
+            start_loop_t = time.perf_counter()
+            alpha = step / steps
+            positions = {}
+            for motor_name, target_position in target_positions.items():
+                current_position = current_positions[motor_name]
+                positions[motor_name] = current_position + (target_position - current_position) * alpha
+            self._send_hold_position(positions)
+
+            if control_interval > 0:
+                dt_s = time.perf_counter() - start_loop_t
+                time.sleep(max(control_interval - dt_s, 0.0))
+
+        self._hold_positions = target_positions.copy()
+        return {f"{motor}.pos": position for motor, position in target_positions.items()}
 
     def _normalized_side(self) -> str:
         side = self.config.side or "right"
