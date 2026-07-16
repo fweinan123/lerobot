@@ -92,6 +92,8 @@ import time
 from dataclasses import asdict, dataclass
 from pprint import pformat
 
+import numpy as np
+
 from lerobot.cameras import CameraConfig  # noqa: F401
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.orbbec import OrbbecCameraConfig  # noqa: F401
@@ -561,6 +563,8 @@ def record_loop(
         if dataset is not None:
             action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
             frame = {**observation_frame, **action_frame, "task": single_task}
+            if "intervention" in dataset.features:
+                frame["intervention"] = np.array([False], dtype=bool)
             dataset.add_frame(frame)
 
         if display_data:
@@ -688,6 +692,11 @@ def record(
                     "lerobot-record is for data collection only. Use lerobot-rollout for policy deployment."
                 )
             cfg.dataset.stamp_repo_id()
+            dataset_features["intervention"] = {
+                "dtype": "bool",
+                "shape": (1,),
+                "names": None,
+            }
             dataset = LeRobotDataset.create(
                 cfg.dataset.repo_id,
                 cfg.dataset.fps,

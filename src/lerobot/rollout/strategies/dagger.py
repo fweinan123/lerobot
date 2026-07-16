@@ -129,6 +129,8 @@ class DAggerEvents:
         self.stop_recording = Event()
         self.upload_requested = Event()
         self.sync_leader_requested = Event()
+        self.correction_record_requested = Event()
+        self.correction_recording_active = Event()
         self.leader_hold_active = Event()
         self._leader_hold_target: dict[str, float] | None = None
 
@@ -177,6 +179,8 @@ class DAggerEvents:
             self._leader_hold_target = None
         self.upload_requested.clear()
         self.sync_leader_requested.clear()
+        self.correction_record_requested.clear()
+        self.correction_recording_active.clear()
         self.leader_hold_active.clear()
 
     def set_leader_hold_target(self, target: dict[str, float]) -> None:
@@ -403,6 +407,23 @@ def _handle_sync_leader_request(ctx: RolloutContext, events: DAggerEvents, play_
         log_say("Failed to sync leader", play_sounds)
 
 
+def _handle_correction_record_request(events: DAggerEvents) -> bool:
+    """Start writing correction frames after the operator presses r."""
+    if not events.correction_record_requested.is_set():
+        return False
+
+    events.correction_record_requested.clear()
+    if events.phase != DAggerPhase.CORRECTING:
+        logger.warning("Correction recording requested outside CORRECTING phase; press tab before r")
+        return False
+
+    if not events.correction_recording_active.is_set():
+        logger.info("Correction frame recording started")
+        events.correction_recording_active.set()
+        return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Input device handlers
 # ---------------------------------------------------------------------------
@@ -453,6 +474,8 @@ def _init_dagger_keyboard(events: DAggerEvents, cfg: DAggerKeyboardConfig):
                 return
             if resolved in key_to_event:
                 events.request_transition(key_to_event[resolved])
+            if resolved == "r":
+                events.correction_record_requested.set()
             if resolved == cfg.upload:
                 events.upload_requested.set()
             if resolved == cfg.sync_leader:
@@ -463,7 +486,7 @@ def _init_dagger_keyboard(events: DAggerEvents, cfg: DAggerKeyboardConfig):
     listener = keyboard.Listener(on_press=on_press)
     listener.start()
     logger.info(
-        "DAgger keyboard listener started (pause_resume='%s', correction='%s', upload='%s', sync_leader='%s', ESC=stop)",
+        "DAgger keyboard listener started (pause_resume='%s', correction='%s', record='r', upload='%s', sync_leader='%s', ESC=stop)",
         cfg.pause_resume,
         cfg.correction,
         cfg.upload,
@@ -654,13 +677,20 @@ class DAggerStrategy(RolloutStrategy):
                             events.clear_leader_hold()
                         if old_phase == DAggerPhase.PAUSED and new_phase == DAggerPhase.CORRECTING:
                             events.clear_leader_hold()
+                            events.correction_record_requested.clear()
+                            events.correction_recording_active.clear()
+                            record_tick = 0
                         if old_phase == DAggerPhase.CORRECTING and new_phase == DAggerPhase.PAUSED:
                             if hold_target := _get_teleop_hold_target(teleop):
                                 events.set_leader_hold_target(hold_target)
                             else:
                                 events.leader_hold_active.set()
+                            events.correction_record_requested.clear()
+                            events.correction_recording_active.clear()
 
                     _handle_sync_leader_request(ctx, events, play_sounds)
+                    if _handle_correction_record_request(events):
+                        record_tick = 0
 
                     phase = events.phase
 
@@ -677,7 +707,7 @@ class DAggerStrategy(RolloutStrategy):
                         robot.send_action(robot_action_to_send)
                         last_action = robot_action_to_send
                         self._log_telemetry(obs_processed, processed_teleop, ctx.runtime)
-                        if record_tick % record_stride == 0:
+                        if events.correction_recording_active.is_set() and record_tick % record_stride == 0:
                             obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
                             action_frame = build_dataset_frame(features, processed_teleop, prefix=ACTION)
                             frame = {
@@ -687,7 +717,8 @@ class DAggerStrategy(RolloutStrategy):
                                 "intervention": np.array([True], dtype=bool),
                             }
                             dataset.add_frame(frame)
-                        record_tick += 1
+                        if events.correction_recording_active.is_set():
+                            record_tick += 1
 
                     # --- PAUSED: hold position ---
                     elif phase == DAggerPhase.PAUSED:
@@ -819,6 +850,7 @@ class DAggerStrategy(RolloutStrategy):
                     transition = events.consume_transition()
                     if transition is not None:
                         old_phase, new_phase = transition
+                        correction_was_recording = events.correction_recording_active.is_set()
                         self._apply_transition(
                             old_phase,
                             new_phase,
@@ -832,14 +864,23 @@ class DAggerStrategy(RolloutStrategy):
                             events.clear_leader_hold()
                         if old_phase == DAggerPhase.PAUSED and new_phase == DAggerPhase.CORRECTING:
                             events.clear_leader_hold()
+                            events.correction_record_requested.clear()
+                            events.correction_recording_active.clear()
+                            record_tick = 0
                         if old_phase == DAggerPhase.CORRECTING and new_phase == DAggerPhase.PAUSED:
                             if hold_target := _get_teleop_hold_target(teleop):
                                 events.set_leader_hold_target(hold_target)
                             else:
                                 events.leader_hold_active.set()
+                            events.correction_record_requested.clear()
+                            events.correction_recording_active.clear()
 
                         # Correction ended -> save episode (blocking if not streaming)
-                        if old_phase == DAggerPhase.CORRECTING and new_phase == DAggerPhase.PAUSED:
+                        if (
+                            old_phase == DAggerPhase.CORRECTING
+                            and new_phase == DAggerPhase.PAUSED
+                            and correction_was_recording
+                        ):
                             with self._episode_lock:
                                 dataset.save_episode()
                             recorded += 1
@@ -858,6 +899,8 @@ class DAggerStrategy(RolloutStrategy):
                         self._background_push(dataset, cfg)
 
                     _handle_sync_leader_request(ctx, events, play_sounds)
+                    if _handle_correction_record_request(events):
+                        record_tick = 0
 
                     phase = events.phase
 
@@ -875,7 +918,7 @@ class DAggerStrategy(RolloutStrategy):
                         last_action = robot_action_to_send
                         self._log_telemetry(obs_processed, processed_teleop, ctx.runtime)
 
-                        if record_tick % record_stride == 0:
+                        if events.correction_recording_active.is_set() and record_tick % record_stride == 0:
                             obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
                             action_frame = build_dataset_frame(features, processed_teleop, prefix=ACTION)
                             dataset.add_frame(
@@ -886,7 +929,8 @@ class DAggerStrategy(RolloutStrategy):
                                     "intervention": np.array([True], dtype=bool),
                                 }
                             )
-                        record_tick += 1
+                        if events.correction_recording_active.is_set():
+                            record_tick += 1
 
                     # --- PAUSED: hold position ---
                     elif phase == DAggerPhase.PAUSED:
