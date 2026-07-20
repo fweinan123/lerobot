@@ -48,6 +48,12 @@ from .utils import (
 )
 from .video_utils import concatenate_video_files, get_video_duration_in_s
 
+INTERVENTION_FEATURE = {
+    "dtype": "bool",
+    "shape": (1,),
+    "names": None,
+}
+
 
 def merge_video_feature_info_for_aggregate(all_metadata: list[LeRobotDatasetMetadata]) -> dict[str, dict]:
     """Create a merged video feature info dictionary for aggregation. The video encoder info is merged field-by-field: each key is kept only when every source agrees; otherwise that key is set to ``null`` (or ``{}`` for ``video.extra_options``) and a warning is logged.
@@ -89,6 +95,23 @@ def merge_video_feature_info_for_aggregate(all_metadata: list[LeRobotDatasetMeta
         merged_info[vk]["info"]["video.video_backend"] = "pyav"
 
     return merged_info
+
+
+def ensure_intervention_feature_for_aggregate(all_metadata: list[LeRobotDatasetMetadata]) -> None:
+    """Allow merging older datasets without intervention by treating it as False."""
+    if not any("intervention" in meta.features for meta in all_metadata):
+        return
+
+    for meta in all_metadata:
+        feature = meta.features.get("intervention")
+        if feature is None:
+            meta.info.features["intervention"] = copy.deepcopy(INTERVENTION_FEATURE)
+            continue
+        if feature != INTERVENTION_FEATURE:
+            raise ValueError(
+                f"Feature 'intervention' must be {INTERVENTION_FEATURE} for automatic merge filling, "
+                f"but got {feature}."
+            )
 
 
 def validate_all_metadata(all_metadata: list[LeRobotDatasetMetadata]):
@@ -320,6 +343,7 @@ def aggregate_datasets(
             LeRobotDatasetMetadata(repo_id, root=root) for repo_id, root in zip(repo_ids, roots, strict=False)
         ]
     )
+    ensure_intervention_feature_for_aggregate(all_metadata)
     fps, robot_type, _ = validate_all_metadata(all_metadata)
     features = merge_video_feature_info_for_aggregate(all_metadata)
     video_keys = [key for key in features if features[key]["dtype"] == "video"]
@@ -524,6 +548,8 @@ def aggregate_data(src_meta, dst_meta, data_idx, data_files_size_in_mb, chunk_si
             df = src_ds.to_pandas()
         else:
             df = pd.read_parquet(src_path)
+        if "intervention" in dst_meta.features and "intervention" not in df.columns:
+            df["intervention"] = False
         df = update_data_df(df, src_meta, dst_meta)
 
         # Write data and get the actual destination file it was written to
