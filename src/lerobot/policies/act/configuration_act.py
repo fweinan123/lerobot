@@ -19,6 +19,18 @@ from lerobot.configs import NormalizationMode, PreTrainedConfig
 from lerobot.optim import AdamWConfig
 
 
+DINO_V2_BACKBONE_ALIASES = {
+    "dinov2_vits14": "facebook/dinov2-small",
+    "dinov2_vitb14": "facebook/dinov2-base",
+    "dinov2_vitl14": "facebook/dinov2-large",
+    "dinov2_vitg14": "facebook/dinov2-giant",
+}
+
+
+def is_dinov2_backbone(vision_backbone: str) -> bool:
+    return vision_backbone in DINO_V2_BACKBONE_ALIASES or vision_backbone.startswith("facebook/dinov2")
+
+
 @PreTrainedConfig.register_subclass("act")
 @dataclass
 class ACTConfig(PreTrainedConfig):
@@ -54,8 +66,13 @@ class ACTConfig(PreTrainedConfig):
         normalization_mapping: A dictionary that maps from a str value of FeatureType (e.g., "STATE", "VISUAL") to
             a corresponding NormalizationMode (e.g., NormalizationMode.MIN_MAX)
         vision_backbone: Name of the torchvision resnet backbone to use for encoding images.
+            Set to one of `dinov2_vits14`, `dinov2_vitb14`, `dinov2_vitl14`, `dinov2_vitg14`, or a
+            Hugging Face DINOv2 model id such as `facebook/dinov2-small` to use a frozen DINOv2 encoder.
         pretrained_backbone_weights: Pretrained weights from torchvision to initialize the backbone.
-            `None` means no pretrained weights.
+            `None` means no pretrained weights. Ignored for DINOv2 backbones.
+        dinov2_model_name: Optional Hugging Face model id overriding the `vision_backbone` mapping.
+        dinov2_freeze: Whether to freeze the DINOv2 encoder. Defaults to True.
+        dinov2_image_size: Optional (width, height) used to resize images with padding before DINOv2.
         replace_final_stride_with_dilation: Whether to replace the ResNet's final 2x2 stride with a dilated
             convolution.
         pre_norm: Whether to use "pre-norm" in the transformer blocks.
@@ -102,6 +119,9 @@ class ACTConfig(PreTrainedConfig):
     # Vision backbone.
     vision_backbone: str = "resnet18"
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
+    dinov2_model_name: str | None = None
+    dinov2_freeze: bool = True
+    dinov2_image_size: tuple[int, int] | None = (224, 224)
     replace_final_stride_with_dilation: int = False
     # Transformer layers.
     pre_norm: bool = False
@@ -143,9 +163,20 @@ class ACTConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
-        if not self.vision_backbone.startswith("resnet"):
+        if self.is_dinov2:
+            if self.dinov2_image_size is not None:
+                width, height = self.dinov2_image_size
+                if width <= 0 or height <= 0:
+                    raise ValueError(
+                        "`dinov2_image_size` width and height must be positive. "
+                        f"Got {self.dinov2_image_size}."
+                    )
+            if self.normalization_mapping.get("VISUAL") == NormalizationMode.MEAN_STD:
+                self.normalization_mapping["VISUAL"] = NormalizationMode.IDENTITY
+        elif not self.vision_backbone.startswith("resnet"):
             raise ValueError(
-                f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
+                "`vision_backbone` must be one of the ResNet variants or a DINOv2 backbone. "
+                f"Got {self.vision_backbone}."
             )
         if self.temporal_ensemble_coeff is not None and self.n_action_steps > 1:
             raise NotImplementedError(
@@ -174,6 +205,10 @@ class ACTConfig(PreTrainedConfig):
     def validate_features(self) -> None:
         if not self.image_features and not self.env_state_feature:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
+
+    @property
+    def is_dinov2(self) -> bool:
+        return is_dinov2_backbone(self.vision_backbone) or self.dinov2_model_name is not None
 
     @property
     def observation_delta_indices(self) -> None:

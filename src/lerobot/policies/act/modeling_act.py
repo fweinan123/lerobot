@@ -22,6 +22,7 @@ The majority of changes here involve removing unused code, unifying naming, and 
 import math
 from collections import deque
 from collections.abc import Callable
+from contextlib import nullcontext
 from itertools import chain
 
 import einops
@@ -34,9 +35,20 @@ from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+from lerobot.utils.import_utils import require_package
 
 from ..pretrained import PreTrainedPolicy
-from .configuration_act import ACTConfig
+from .configuration_act import ACTConfig, DINO_V2_BACKBONE_ALIASES
+
+
+DINO_V2_IMAGE_MEAN = (0.485, 0.456, 0.406)
+DINO_V2_IMAGE_STD = (0.229, 0.224, 0.225)
+
+
+def resolve_dinov2_model_name(config: ACTConfig) -> str:
+    if config.dinov2_model_name is not None:
+        return config.dinov2_model_name
+    return DINO_V2_BACKBONE_ALIASES.get(config.vision_backbone, config.vision_backbone)
 
 
 def resize_with_pad(img: Tensor, width: int, height: int, pad_value: float = 0.0) -> Tensor:
@@ -161,8 +173,11 @@ class ACTPolicy(PreTrainedPolicy):
             img = batch[key]
             if self.config.image_crop_params is not None and key in self.config.image_crop_params:
                 img = crop_image(img, key, self.config.image_crop_params[key])
-            if self.config.resize_imgs_with_padding is not None:
-                img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0.0)
+            resize_size = self.config.resize_imgs_with_padding
+            if resize_size is None and self.config.is_dinov2:
+                resize_size = self.config.dinov2_image_size
+            if resize_size is not None:
+                img = resize_with_pad(img, *resize_size, pad_value=0.0)
             if self.training and self.config.image_brightness_contrast_jitter is not None:
                 img = apply_brightness_contrast_jitter(img, self.config.image_brightness_contrast_jitter)
             images.append(img)
@@ -404,15 +419,43 @@ class ACT(nn.Module):
 
         # Backbone for image feature extraction.
         if self.config.image_features:
-            backbone_model = getattr(torchvision.models, config.vision_backbone)(
-                replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
-                weights=config.pretrained_backbone_weights,
-                norm_layer=FrozenBatchNorm2d,
-            )
-            # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
-            # feature map).
-            # Note: The forward method of this returns a dict: {"feature_map": output}.
-            self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+            if self.config.is_dinov2:
+                require_package("transformers", extra="act_dinov2")
+                from transformers import AutoModel
+
+                self.backbone = AutoModel.from_pretrained(resolve_dinov2_model_name(config))
+                dino_hidden_size = getattr(self.backbone.config, "hidden_size", None)
+                if dino_hidden_size is None:
+                    raise ValueError("DINOv2 backbone config must expose `hidden_size`.")
+                if config.dinov2_freeze:
+                    self.backbone.requires_grad_(False)
+                    self.backbone.eval()
+                self.encoder_img_feat_input_proj = nn.Linear(dino_hidden_size, config.dim_model)
+                self.register_buffer(
+                    "dinov2_image_mean",
+                    torch.tensor(DINO_V2_IMAGE_MEAN, dtype=torch.float32).view(1, 3, 1, 1),
+                    persistent=False,
+                )
+                self.register_buffer(
+                    "dinov2_image_std",
+                    torch.tensor(DINO_V2_IMAGE_STD, dtype=torch.float32).view(1, 3, 1, 1),
+                    persistent=False,
+                )
+            else:
+                backbone_model = getattr(torchvision.models, config.vision_backbone)(
+                    replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
+                    weights=config.pretrained_backbone_weights,
+                    norm_layer=FrozenBatchNorm2d,
+                )
+                # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
+                # feature map).
+                # Note: The forward method of this returns a dict: {"feature_map": output}.
+                self.backbone = IntermediateLayerGetter(
+                    backbone_model, return_layers={"layer4": "feature_map"}
+                )
+                self.encoder_img_feat_input_proj = nn.Conv2d(
+                    backbone_model.fc.in_features, config.dim_model, kernel_size=1
+                )
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
@@ -429,10 +472,6 @@ class ACT(nn.Module):
                 self.config.env_state_feature.shape[0], config.dim_model
             )
         self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
-        if self.config.image_features:
-            self.encoder_img_feat_input_proj = nn.Conv2d(
-                backbone_model.fc.in_features, config.dim_model, kernel_size=1
-            )
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent
         if self.config.robot_state_feature:
@@ -451,6 +490,34 @@ class ACT(nn.Module):
         self.action_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
 
         self._reset_parameters()
+
+    def _extract_dinov2_patch_tokens(self, img: Tensor) -> tuple[Tensor, tuple[int, int]]:
+        patch_size = getattr(self.backbone.config, "patch_size", 14)
+        grid_height = img.shape[-2] // patch_size
+        grid_width = img.shape[-1] // patch_size
+        if grid_height <= 0 or grid_width <= 0:
+            raise ValueError(
+                f"DINOv2 image size {tuple(img.shape[-2:])} is too small for patch size {patch_size}."
+            )
+
+        pixel_values = img.clamp(0.0, 1.0)
+        pixel_values = (pixel_values - self.dinov2_image_mean.to(pixel_values.dtype)) / (
+            self.dinov2_image_std.to(pixel_values.dtype)
+        )
+        if self.config.dinov2_freeze:
+            self.backbone.eval()
+        grad_ctx = torch.no_grad() if self.config.dinov2_freeze else nullcontext()
+        with grad_ctx:
+            outputs = self.backbone(pixel_values=pixel_values, interpolate_pos_encoding=True)
+        patch_tokens = outputs.last_hidden_state[:, 1:]
+        expected_tokens = grid_height * grid_width
+        if patch_tokens.shape[1] != expected_tokens:
+            raise ValueError(
+                "DINOv2 returned an unexpected number of patch tokens. "
+                f"Expected {expected_tokens} for grid {(grid_height, grid_width)}, "
+                f"got {patch_tokens.shape[1]}."
+            )
+        return patch_tokens, (grid_height, grid_width)
 
     def _reset_parameters(self):
         """Xavier-uniform initialization of the transformer parameters as in the original code."""
@@ -553,13 +620,27 @@ class ACT(nn.Module):
             # NOTE: If modifying this section, verify on MPS devices that
             # gradients remain stable (no explosions or NaNs).
             for img in batch[OBS_IMAGES]:
-                cam_features = self.backbone(img)["feature_map"]
-                cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
-                cam_features = self.encoder_img_feat_input_proj(cam_features)
+                if self.config.is_dinov2:
+                    patch_tokens, (grid_height, grid_width) = self._extract_dinov2_patch_tokens(img)
+                    cam_features = self.encoder_img_feat_input_proj(patch_tokens)
+                    pos_ref = cam_features.new_empty(
+                        (cam_features.shape[0], self.config.dim_model, grid_height, grid_width)
+                    )
+                    cam_pos_embed = self.encoder_cam_feat_pos_embed(pos_ref).to(dtype=cam_features.dtype)
 
-                # Rearrange features to (sequence, batch, dim).
-                cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
-                cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
+                    # Rearrange features to (sequence, batch, dim).
+                    cam_features = einops.rearrange(cam_features, "b (h w) c -> (h w) b c", h=grid_height)
+                    cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
+                else:
+                    cam_features = self.backbone(img)["feature_map"]
+                    cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(
+                        dtype=cam_features.dtype
+                    )
+                    cam_features = self.encoder_img_feat_input_proj(cam_features)
+
+                    # Rearrange features to (sequence, batch, dim).
+                    cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
+                    cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
 
                 # Extend immediately instead of accumulating and concatenating
                 # Convert to list to extend properly
